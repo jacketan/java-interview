@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# 构建与临时产物
+node_modules/
+dist/
+*.log
