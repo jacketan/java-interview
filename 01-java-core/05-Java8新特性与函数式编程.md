@@ -27,10 +27,10 @@
 
 | 阶段 | 产物 | 关键类/属性 |
 | --- | --- | --- |
-| javac 编译 | 方法体被抽取成 `private static` 合成方法 `lambda$main$0` | `MethodParameters`、合成方法名以 `lambda$` 开头 |
-| javac 编译 | 调用点生成 `invokedynamic` 指令，签名为函数式接口的抽象方法 | class 文件 `BootstrapMethods` 属性 |
+| javac 编译 | 方法体被抽取成合成方法 `lambda$main$0`（不引用 `this`/实例成员时是 `private static`，引用了则是 `private` 实例方法） | `MethodParameters`、合成方法名以 `lambda$` 开头 |
+| javac 编译 | 调用点生成 `invokedynamic` 指令，描述符的参数是捕获变量、返回类型是函数式接口 | class 文件 `BootstrapMethods` 属性 |
 | 首次执行 | JVM 调用 bootstrap 方法，得到 `CallSite` | `java.lang.invoke.LambdaMetafactory#metafactory` |
-| 后续执行 | 直接通过 `CallSite` 拿到接口实现实例并调用 | `ConstantCallSite` 或 `MutableCallSite` |
+| 后续执行 | 直接通过 `CallSite` 拿到接口实现实例并调用 | 固定是 `ConstantCallSite`（捕获变量时 target 是创建实例的方法句柄：JDK 8/11 为生成类的 `get$Lambda` 工厂方法，JDK 17 为生成类的构造器） |
 
 关键方法签名（JDK 8 起固定，9-21 未变）：
 
@@ -43,7 +43,8 @@ public static CallSite metafactory(MethodHandles.Lookup caller,
                                    MethodHandle implMethod,
                                    MethodType instantiatedMethodType)
 
-// 方法引用（构造器/方法引用）走这个，多一个 altMetafactory 还能声明"可序列化"
+// 当函数式接口是 Serializable、或需要 marker / bridge 方法时，javac 改用 altMetafactory：
+// 通过 Object... args 里的 FLAG_SERIALIZABLE / FLAG_MARKERS / FLAG_BRIDGES 声明
 public static CallSite altMetafactory(MethodHandles.Lookup caller,
                                       String invokedName,
                                       MethodType invokedType,
@@ -95,8 +96,9 @@ flowchart TD
 
 原始类型特化（避免装箱，JDK 8 起在 `java.util.function` 下）：
 
-- 入参特化：`IntFunction<R>`、`IntPredicate`、`IntConsumer`、`IntSupplier`、`IntUnaryOperator`、`IntBinaryOperator`、`ToIntFunction<T>`、`ToIntBiFunction<T,U>`。
-- 出入参都特化：`IntToLongFunction`、`IntToDoubleFunction`、`LongToIntFunction` 等组合。
+- 入参特化：`IntFunction<R>`、`IntPredicate`、`IntConsumer`。
+- 出参特化：`IntSupplier`、`ToIntFunction<T>`、`ToIntBiFunction<T,U>`（入参仍是引用类型，省的是返回值的装箱）。
+- 出入参都特化：`IntUnaryOperator`、`IntBinaryOperator`、`IntToLongFunction`、`IntToDoubleFunction`、`LongToIntFunction` 等组合。
 - 为什么重要：`Stream<Integer>` 每个元素都是引用，`mapToInt`/`IntStream` 可以省掉 `Integer` 的装箱与缓存查找，在千万级数值计算里差几倍。
 
 ### 1.3 方法引用的 5 种形式
@@ -163,7 +165,7 @@ List.of(1, 2, 3).forEach(x -> counter[0] += x); // 合法，但线上代码请�
 - `StatefulOp`：`sorted`、`distinct`、`limit`、`skip`、`takeWhile`、`dropWhile` 等有状态中间操作。
 - 终止操作由 `TerminalOp` 实现：`ForEachOps`、`ReduceOps`、`FindOps`、`MatchOps`、`Collectors` 驱动的 `ReduceOps.makeRef`。
 
-**中间操作只是构造链表**，每个操作把自己包装成新的 `AbstractPipeline`，前一阶段通过 `previousStage` 反向引用，最终在终止操作里由 `AbstractPipeline#evaluate` 触发一次**从上到下的 `Sink` 链**（`Sink` 接口只有三个方法：`begin(long size)`、`accept(T)`、`end()`）。
+**中间操作只是构造链表**，每个操作把自己包装成新的 `AbstractPipeline`，前一阶段通过 `previousStage` 反向引用，最终在终止操作里由 `AbstractPipeline#evaluate` 触发一次**从上到下的 `Sink` 链**（`Sink` 的驱动方法是 `begin(long size)`、`accept(T)`（继承自 `Consumer`）、`end()`，短路判断靠 `cancellationRequested()`）。
 
 ```mermaid
 flowchart LR
@@ -208,10 +210,10 @@ Stream.of("a", "bb", "ccc", "dddd")
 | `flatMap(Function)` | 中间 | 否 | 否 | 一对多并扁平化 |
 | `mapToInt/mapToLong/mapToDouble` | 中间 | 否 | 否 | 返回特化流，避免装箱 |
 | `peek(Consumer)` | 中间 | 否 | 否 | 仅调试；JDK 9+ 在 `count()` 为终止操作时可能完全不执行 |
-| `distinct()` | 中间 | **是** | 否 | 内部用 `LinkedHashSet` 保序去重 |
+| `distinct()` | 中间 | **是** | 否 | 内部用 `Set` 缓存已见元素并逐元素下发保序（并行有序时物化为 `LinkedHashSet`） |
 | `sorted()` | 中间 | **是** | 否 | 全量缓存到数组后 `Arrays.sort` |
-| `limit(n)` / `skip(n)` | 中间 | **是** | 是 | 设置 barrier，与 `sorted` 组合时顺序敏感 |
-| `takeWhile` / `dropWhile` | 中间 | **是** | 是 | JDK 9 起提供，需要记住"前面是否已判定失败" |
+| `limit(n)` / `skip(n)` | 中间 | **是** | limit 是 / skip 否 | 设置 barrier，与 `sorted` 组合时顺序敏感 |
+| `takeWhile` / `dropWhile` | 中间 | **是** | takeWhile 是 / dropWhile 否 | JDK 9 起提供，需要记住"前面是否已判定失败" |
 | `forEach(Consumer)` | 终止 | - | 否 | 并行时无序 |
 | `forEachOrdered(Consumer)` | 终止 | - | 否 | 并行时保证遭遇顺序，代价是同步 |
 | `collect(Collector)` | 终止 | - | 否 | 最常用 |
@@ -295,7 +297,7 @@ sequenceDiagram
 2. **`ThreadLocal` / MDC 丢失**：worker 线程复用的是池线程，`TraceId`、`SecurityContext` 不会跟随主线程，日志链路断掉，`SecurityContextHolder` 可能取到上一个请求的上下文（脏读）。
 3. **有状态 Lambda 会丢数据**：`ArrayList.add` 在并行流下非线程安全，可能出现元素丢失或 `ArrayIndexOutOfBoundsException`。要并行收集就用 `collect(Collectors.toList())` 或 `Collectors.toConcurrentMap`。
 4. **顺序不确定**：`forEach` 用 `forEachOrdered` 才保证遭遇顺序；`findFirst` 在并行流里代价高于 `findAny`。
-5. **HashMap 不是并发安全的**：`Collectors.toMap` 的合并函数要到 `combiner` 阶段才触发，不要在 `accumulator` 里写共享可变状态。
+5. **不要在 `accumulator` 里写共享可变状态**：并行时 `toMap` 的每个分段由 `supplier`（默认 `HashMap`）各建一份容器，最后由 `combiner` 合并；但 merge 函数在 `accumulator` 阶段遇到同 key 就会触发（JDK 8 走 `map.merge`），所以它必须无副作用、可重复调用。
 6. **小数据量更慢**：任务拆分、`ForkJoinTask` 调度、结果合并都有固定成本。经验阈值：元素少于约 1 万、或单个元素处理耗时为纳秒级时，串行 `for` 通常更快；真正收益来自**数据量大 + 单元素计算重 + 无阻塞**。
 
 ### 2.5 Collectors 常用收集器
@@ -348,6 +350,8 @@ Map.Entry<Integer, Integer> mm = IntStream.of(3, 1, 9).boxed().collect(Collector
 ```
 
 自定义 `Collector` 时最容易忽略的是 `combiner`：**并行流分段收集后再合并，`combiner` 写错（例如直接返回 `a`）在串行下完全正常，上量后结果就错**。
+
+同样的约束适用于 `reduce`/`reducing`：**并行归约要求 accumulator 与 combiner 满足结合律，且 identity 必须是真正的单位元**（JDK 8 的 `java.util.stream` 包说明里有专门的 "Associativity" 一节）。反例：`Stream.of(1,2,3,4).reduce(0, (x,y) -> x - y)` 串行得 `-10`，并行可能得 `0`；非结合的运算只能用串行。
 
 ### 2.6 Stream 的性能与适用边界
 
@@ -456,10 +460,10 @@ stateDiagram-v2
 
 JDK 8 引入 `default` 方法（JEP 126 的配套能力），动机有两个：
 
-1. **接口演化**：`Collection` 在 JDK 8 新增了 `stream()`、`parallelStream()`、`forEach()`、`removeIf()`、`spliterator()`。如果没有默认方法，所有第三方集合实现（Guava、Hibernate 的 `PersistentBag` 等）都要改代码，二进制兼容性被破坏。
+1. **接口演化**：`Collection` 在 JDK 8 新增了 `stream()`、`parallelStream()`、`removeIf()`、`spliterator()`（`forEach()` 则是 JDK 8 加到 `Iterable` 上的默认方法）。如果没有默认方法，所有第三方集合实现（Guava、Hibernate 的 `PersistentBag` 等）都要改代码，二进制兼容性被破坏。
 2. **函数式组合**：让 `Comparator.thenComparing`、`Predicate.and/or/negate`、`Function.andThen/compose` 这类组合子可以不破坏现有实现地加进来。
 
-二进制兼容性结论要背准：**向接口新增 `default` 方法，对已有实现类是二进制兼容的；新增抽象方法则不兼容（老实现类加载时 `AbstractMethodError`）**。
+二进制兼容性结论要背准：**向接口新增 `default` 方法，对已有实现类是二进制兼容的；新增抽象方法后老实现类仍能加载与实例化，但一调用到该新方法就抛 `AbstractMethodError`**（源码层面不兼容：老实现类重新编译会直接报错）。
 
 ```java
 public interface Cache<K, V> {
@@ -622,7 +626,7 @@ LocalDateTime t = LocalDateTime.parse("2025-01-01 10:00:00", f);
 JDK 8 起 `java.time`（JSR-310）替代 `Date`/`Calendar`，核心设计：
 
 - **全部不可变**：`LocalDate`、`LocalTime`、`LocalDateTime`、`Instant`、`Duration`、`Period`、`ZonedDateTime`、`OffsetDateTime`、`ZoneId`、`ZoneOffset` 都是 `final` 且字段 `final`，因此天然线程安全，可作为常量复用。
-- **时间线与日历分离**：`Instant`/`Duration` 表示**时间线上的点与量**（UTC，`Duration.between(a, b)` 得到精确时长）；`LocalDate`/`Period` 表示**日历语义**。`Period.between(LocalDate.of(2024,1,31), LocalDate.of(2024,2,29))` 返回 `P29D`（`months=0, days=29`）而不是 `P1M`，因为 2024-01-31 加 1 个月会越界。跨 DST 的"一天"用 `Duration` 是 23 或 25 小时，用 `Period` 才是 1 天。
+- **时间线与日历分离**：`Instant`/`Duration` 表示**时间线上的点与量**（UTC，`Duration.between(a, b)` 得到精确时长）；`LocalDate`/`Period` 表示**日历语义**。`Period.between(LocalDate.of(2024,1,31), LocalDate.of(2024,2,29))` 返回 `P29D`（`months=0, days=29`）而不是 `P1M`：`LocalDate#until` 取的是**不超过终点的最大整月数**，整月数取 1 会让 days 变成负数，于是回退一个月、把差额算成天数。跨 DST 的"一天"用 `Duration` 是 23 或 25 小时，用 `Period` 才是 1 天。
 - **时区必须显式**：`ZoneId.of("Asia/Shanghai")` 优于三位缩写 `CTT`/`PRC`（三位 id 是历史别名，语义模糊）。`ZoneId.systemDefault()` 依赖 `user.timezone` 与 `TZ`，容器里常为 UTC，**一定在应用启动时打印一次实际时区**。
 - **精度**：`Instant`/`LocalTime` 支持到纳秒（`ChronoUnit.NANOS`），但 `System.currentTimeMillis()` 只有毫秒，`Instant.now()` 在 JDK 8 用 `Clock.systemUTC()` 也常为毫秒精度（JDK 9+ 平台上可能给到微秒）。做序列号/版本号时不要假设纳秒唯一。
 - **计算 API**：`plusDays`、`minusMonths`、`with(TemporalAdjusters.lastDayOfMonth())`、`until`、`ChronoUnit.DAYS.between(a, b)`。
@@ -651,6 +655,7 @@ flowchart TD
 
 - JDBC 4.2（Java 8）起支持 `PreparedStatement#setObject(int, LocalDateTime)` / `getObject(int, LocalDateTime.class)`；MySQL Connector/J 8.0 支持 `LocalDate`/`LocalDateTime`。
 - Jackson 需要注册 `JavaTimeModule`（`jackson-datatype-jsr310`），并把 `SerializationFeature.WRITE_DATES_AS_TIMESTAMPS` 关闭（默认 `true` 会输出 `[2025,1,1,10,0,0]` 数组）；`LocalDateTime` 不携带时区，跨时区服务间传输建议统一用 `Instant` 或 `OffsetDateTime`。
+- 与老 API 互转（均 JDK 8 起）：`Date#toInstant()` / `Date.from(Instant)`、`Calendar#toInstant()`、`GregorianCalendar#toZonedDateTime()`、`TimeZone#toZoneId()`。注意 `java.sql.Date#toInstant()` 直接抛 `UnsupportedOperationException`（SQL `Date` 没有时间分量），要转得走 `java.sql.Date#toLocalDate()`、`Timestamp#toLocalDateTime()`。
 
 ---
 
@@ -768,7 +773,7 @@ scheduler.schedule(() -> f.completeExceptionally(new TimeoutException()), 800, T
 | 事故现象 | 根因 | 排查方法 |
 | --- | --- | --- |
 | 接口 P99 抖动，线程名大量 `ForkJoinPool.commonPool-worker-*` 阻塞在 socketRead | 用 `supplyAsync` 无 executor 重载做 IO | `jstack` 抓栈统计线程名与阻塞方法；`jcmd <pid> Thread.print` |
-| 某个 Async 任务"偶发不执行" | `commonPool` 并行度=1 时退化为每任务一线程，或被上游长任务占满 | 打印 `ForkJoinPool.getCommonPoolParallelism()`；改自建池 |
+| 某个 Async 任务"偶发不执行" | `commonPool` 被阻塞任务占满时一直排队（看起来像没执行），或异常没被处理而静默丢弃 | 打印 `ForkJoinPool.getCommonPoolParallelism()` 与线程栈；改自建池并显式处理异常 |
 | 依赖的下游超时后上游仍占线程 | `orTimeout` 只改变 future 状态，不中断任务 | 核对 HTTP/DB 客户端超时配置 |
 | 内存持续上涨，堆里大量 `CompletableFuture$UniApply` | 链尾未消费（没有终止落点），`stack` 引用链长期存活 | `jmap -histo:live <pid>` 看类计数 |
 | CPU 飙高但业务量没涨 | 在 `thenApply` 中做 CPU 密集计算，跑在了 IO 线程池 | 火焰图 `async-profiler -e cpu` 看调用栈归属线程池 |
@@ -792,7 +797,7 @@ sequenceDiagram
 
 - **必做**：所有涉及 IO、DB、RPC 的 `*Async` 都传自建 `ThreadPoolExecutor`，并按「每个下游一个池 + 池大小 = 目标 QPS × 平均 RT」估算；用有界队列（`ArrayBlockingQueue`）+ 明确拒绝策略（`CallerRunsPolicy` 会拖慢调用方，`AbortPolicy` 会抛 `RejectedExecutionException`）。
 - **不要用 `Executors.newFixedThreadPool`**：无界队列 + `maximumPoolSize` 失效，任务堆积到 OOM（`LinkedBlockingQueue` 默认容量 `Integer.MAX_VALUE`）。
-- **死锁场景 1**：`thenApply` 里 `join` 自己 —— `f.thenApply(x -> f.join())` 在 `f` 未完成时注册，回调由完成 `f` 的线程执行，此时 `f.join()` 永远阻塞。
+- **死锁场景 1（很多资料写错）**：`thenApply` 里 `join` 自己 —— `f.thenApply(x -> f.join())` **不会**死锁：`complete()` 先写入 `result` 再 `postComplete()`，回调执行时 `f.join()` 立即返回。会自锁的是「等一个尚未完成、且只能由当前线程推进的 future」，典型就是下面的场景 2。
 - **死锁场景 2**：线程池 A 的任务等待提交给池 A 的任务（池内互相等待），池满即死锁。典型是「一个池同时承担编排与执行」。
 - **上下文传递**：`CompletableFuture` 不传递 `ThreadLocal`。要传 MDC/TraceId，用阿里 `TransmittableThreadLocal` 配合 `TtlExecutors.getTtlExecutorService(pool)`，或在 lambda 入口手动 `MDC.put`。
 
@@ -866,7 +871,7 @@ record Rect(double w, double h) implements Shape { }
 final class Triangle implements Shape { }   // 子类必须是 final、sealed 或 non-sealed
 ```
 
-- `permits` 列表可以省略：当所有子类型都定义在同一个编译单元（同一个源文件/模块）内时，由编译器推断许可的子类型。
+- `permits` 列表可以省略：当所有子类型都定义在**同一个编译单元**（同一个源文件）内时，由编译器推断许可的子类型；即使同包但分在不同文件，也必须显式写 `permits`。
 - 子类型修饰符只能三选一：`final`（封闭）、`sealed`（继续受限）、`non-sealed`（重新开放继承）。
 - 价值：让编译器知道**类型的全集**，从而 `switch` 表达式可以做穷尽性检查，不需要 `default` 分支。这是"代数数据类型"在 Java 里的落地方式。
 - 反射 API：`Class#isSealed()`、`Class#getPermittedSubclasses()`（JDK 17 起）。
@@ -1080,8 +1085,8 @@ stateDiagram-v2
 **答题框架（30 秒版）**：key 映射函数对两个元素产出了相同 key，而没有提供 merge 函数。修复是传入 `BinaryOperator` 合并函数，或先按 key 去重。
 
 **展开（2 分钟版）**：
-1. 源码路径：`Collectors.toMap` 最终调用 `map.merge(k, v, mergeFn)`；无 merge 函数时 `uniqKeysMapAccumulator` 直接 `putIfAbsent` 并在冲突时抛异常，异常消息只给一个 key（JDK 8 打印 `Duplicate key <key>`，JDK 9+ 附带已有值）。
-2. 定位：看堆栈的 `Collectors.lambda$uniqKeysMapAccumulator`，再回查哪个字段做了 map 的 key。
+1. 源码路径：带 merge 函数的版本最终调用 `map.merge(k, v, mergeFn)`；不带 merge 函数时，JDK 9+ 的 `uniqKeysMapAccumulator` 直接 `putIfAbsent` 并在冲突时抛异常，JDK 8 则是 `map.merge` + `throwingMerger`。异常消息只给一个 key（JDK 8 打印 `Duplicate key <key>`，JDK 9+ 附带已有值）。
+2. 定位：看堆栈里的 `Collectors` 合成方法（JDK 9+ 是 `lambda$uniqKeysMapAccumulator`，JDK 8 是 `lambda$throwingMerger$0` → `HashMap.merge`），再回查哪个字段做了 map 的 key。
 3. 另外两个坑：`value` 为 null 会抛 NPE（`HashMap#merge` 的 `Objects.requireNonNull(value)`）；`toMap` 收集到的是 `HashMap`，key 类型必须实现 `hashCode/equals`。
 4. 需要保序时用四参版本传 `LinkedHashMap::new`；需要并发时用 `toConcurrentMap`。
 

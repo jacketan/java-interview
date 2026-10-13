@@ -31,7 +31,7 @@ InnoDB 与磁盘交互的最小单位是**页（page）**，默认 16KB，由 `i
 
 1. 哪怕你只查一行，InnoDB 也要把这行所在的整页 16KB 读进内存。
 2. 一次随机 IO 的代价远大于把 16KB 里的数据全部扫一遍的 CPU 代价，所以**减少随机 IO 次数**是索引结构设计的第一目标。
-3. 操作系统预读（`innodb_read_ahead_threshold` 默认 56）会把相邻页一起读进来，顺序扫描的性价比远高于随机扫描。
+3. InnoDB 的线性预读（`innodb_read_ahead_threshold` 默认 56）会把相邻页一起读进来，顺序扫描的性价比远高于随机扫描。
 
 一个 16KB 的 INDEX 页（`FIL_PAGE_INDEX`）内部布局如下（MySQL 8.0 源码 `page0page.h` 定义）：
 
@@ -197,7 +197,7 @@ EXPLAIN SELECT user_id, status, amount, created_at FROM t_order WHERE user_id = 
 -- 覆盖索引：三列都在 idx_user_status_amount 里，Extra = Using index
 EXPLAIN SELECT user_id, status, amount FROM t_order WHERE user_id = 100 AND status = 1;
 
--- 看似覆盖索引，实则不是：count(1) 用不到索引列，但优化器可以只扫索引
+-- 覆盖索引：COUNT(*) 不需要任何列值，按 user_id 定位后直接数索引记录，Extra = Using index
 EXPLAIN SELECT COUNT(*) FROM t_order WHERE user_id = 100;
 ```
 
@@ -323,7 +323,7 @@ ALTER TABLE t_order DROP INDEX idx_user_status_amount, ALGORITHM=INPLACE, LOCK=N
 | `WHERE a>1 AND b=2` | a | `range` | b 不能定位，只能 ICP |
 | `WHERE a=1 ORDER BY b` | a,b | `ref` | 排序可用索引，无 filesort |
 | `WHERE a=1 ORDER BY c` | a | `ref` | 排序断在 c，`Using filesort` |
-| `WHERE a=1 ORDER BY b DESC, c ASC` | a | `ref` | 方向不一致，MySQL 8.0 前必 filesort |
+| `WHERE a=1 ORDER BY b DESC, c ASC` | a | `ref` | 方向不一致要 filesort，除非另建匹配的 `(a, b DESC, c ASC)` 降序索引 |
 
 ### 4.2 索引下推 ICP：5.5 与 5.6 的分水岭
 
@@ -415,7 +415,7 @@ ALTER TABLE t_order ADD KEY idx_month ((MONTH(created_at)));
 -- phone 是 VARCHAR(11)，索引 idx_phone
 -- 失效：参数是数字，MySQL 把列转成 DOUBLE 比较
 SELECT * FROM t_user WHERE phone = 13800000000;
--- EXPLAIN 的 Extra 里会看到 WHERE 中有 cast(phone as double)
+-- EXPLAIN FORMAT=TREE（或 FORMAT=JSON 的 attached_condition、SHOW WARNINGS）里会看到 cast(phone as double)
 
 -- 有效：加引号
 SELECT * FROM t_user WHERE phone = '13800000000';
@@ -435,7 +435,7 @@ SELECT * FROM t_user WHERE id = '123';   -- 走索引
 SELECT * FROM t_a a JOIN t_b b ON a.code = b.code;
 ```
 
-机制：字符集不同时，MySQL 必须先把一侧转换成公共字符集，转换发生在被驱动表的列上，导致索引失效。这不是"有时候"，而是**必然**失效。
+机制：字符集不同时，MySQL 必须先把一侧转换成公共字符集，**转换发生在哪一侧，哪一侧的索引就失效**（`utf8mb4` 与 `utf8mb3` 比较时转的是 `utf8mb3` 一侧），这不是"有时候"，而是必然。
 
 排查方法：
 
@@ -448,7 +448,7 @@ FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA = 'your_db' AND COLUMN_NAME = 'code';
 ```
 
-**统一用 `utf8mb4` + `utf8mb4_0900_ai_ci`（MySQL 8.0 默认）可以规避整类问题。**注意 MySQL 8.0 的默认字符集已从 `latin1` 改为 `utf8mb4`，默认排序规则是 `utf8mb4_0900_ai_ci`。
+<strong>统一用 `utf8mb4` + `utf8mb4_0900_ai_ci`（MySQL 8.0 默认）可以规避整类问题。</strong>注意 MySQL 8.0 的默认字符集已从 `latin1` 改为 `utf8mb4`，默认排序规则是 `utf8mb4_0900_ai_ci`。
 
 ### 5.4 前导通配符 LIKE
 
@@ -497,7 +497,7 @@ SELECT * FROM t WHERE name NOT LIKE '张%';
 
 机制：这些条件**理论上可以用索引做范围扫描**，但优化器要判断代价。如果 `status != 1` 能过滤掉的比例很低（比如 90% 的行都是 `status != 1`），优化器会认为"扫描二级索引 + 回表"比"全表顺序扫描"更贵，直接选 `type=ALL`。**这不是语法失效，是代价选择。**
 
-正确的面试回答是：**`!=` 不是必然失效，而是当过滤后剩余行数占比很高时会被优化器放弃。**验证方法是用 `FORCE INDEX` 对比 `Handler_read_*`。
+正确的面试回答是：<strong>`!=` 不是必然失效，而是当过滤后剩余行数占比很高时会被优化器放弃。</strong>验证方法是用 `FORCE INDEX` 对比 `Handler_read_*`。
 
 ### 5.8 IS NOT NULL 与 IS NULL
 
@@ -530,6 +530,7 @@ MySQL 8.0 之前虽然语法接受 `DESC`，但**实际创建的都是升序索�
 3. **回表代价太高**：需要返回的行数占表比例超过约 20%~30% 时，回表成本超过顺序扫描。
 4. **`eq_range_index_dive_limit`**：MySQL 8.0 默认 **200**（5.7 是 10）。当 `IN` 列表长度超过该值，优化器从"索引下潜（index dive）"精确估算退化为使用索引统计信息粗略估算，可能选错计划。
 5. **`FORCE INDEX` 会关闭优化器自动选择**，可能让 MySQL 在参数变化后无法自适应。
+6. **`IN` 列表过长**：range 优化器要为每个取值展开区间并占内存，超过 `range_optimizer_max_mem_size`（默认 8388608 字节即 8MB）时会直接放弃索引，SQL 退化成全表扫描，同时给出 `Memory capacity of 8388608 bytes for 'range_optimizer_max_mem_size' exceeded` 的告警。批量查询必须把 `IN` 列表切片。
 
 ```sql
 -- 验证优化器估算与实际执行的差距
@@ -879,7 +880,7 @@ MySQL 8.0.18 引入，8.0.20 成为无索引等值连接的主流算法。把**�
 1. **小表驱动大表**。这里的"小"指的是**过滤后参与连接的行数**，不是表的物理行数。`WHERE` 过滤后只剩 10 行的表，即使有 1 亿行，也是"小表"。
 2. **被驱动表的关联列必须有索引**。这是比"谁驱动"重要一百倍的事——被驱动表没索引，10 万 × 100 万就是灾难。
 3. **`LEFT JOIN` 左表是驱动表，`RIGHT JOIN` 右表是驱动表**，`INNER JOIN` 由优化器决定（可能重排顺序）。
-4. **尽量把过滤条件写在 `WHERE` 而不是 `ON`**。对 `LEFT JOIN`，`ON` 里的被驱动表条件不影响驱动表行数，`WHERE` 里的条件会把 `LEFT JOIN` 退化成 `INNER JOIN` 并改变驱动表选择。
+4. **过滤条件写 `ON` 还是 `WHERE` 语义不同，要按需求选**。对 `LEFT JOIN`，`ON` 里的被驱动表条件不影响驱动表行数（不匹配的左表行补 `NULL`），`WHERE` 里的条件会把 `LEFT JOIN` 退化成 `INNER JOIN` 并改变驱动表选择。
 
 ```sql
 -- 优化器可能把小表重排到前面
@@ -1062,6 +1063,9 @@ MySQL 5.6 引入 Online DDL，通过 `ALGORITHM` 和 `LOCK` 子句控制：
 ```sql
 -- 加二级索引：MySQL 5.6 起支持 INPLACE + NONE
 ALTER TABLE t_order ADD KEY idx_user_status (user_id, status), ALGORITHM=INPLACE, LOCK=NONE;
+
+-- MySQL 8.0 还可以把新索引直接建成不可见：索引先建好但不让优化器用，验证收益后再 VISIBLE
+ALTER TABLE t_order ADD KEY idx_x (x) INVISIBLE, ALGORITHM=INPLACE, LOCK=NONE;
 ```
 
 ### 11.2 为什么"允许并发 DML"仍然可能把主库拖死
@@ -1082,7 +1086,7 @@ Online DDL 期间，所有对表的 DML（insert/update/delete）都要额外写
 -- 设置锁等待上限，超时就失败而不是把后续请求全堵住
 SET SESSION lock_wait_timeout = 5;      -- 默认 31536000 秒（1 年）
 SET SESSION innodb_lock_wait_timeout = 5;  -- 默认 50 秒
-SET SESSION innodb_online_alter_log_max_size = 512 * 1024 * 1024;
+SET GLOBAL innodb_online_alter_log_max_size = 512 * 1024 * 1024;  -- 该变量只有 GLOBAL 作用域，用 SESSION 会直接报错
 
 -- 确认没有长事务
 SELECT trx_id, trx_state, trx_started, TIMESTAMPDIFF(SECOND, trx_started, NOW()) AS sec,
@@ -1227,7 +1231,7 @@ SELECT
   DIGEST_TEXT,
   COUNT_STAR AS exec_cnt,
   ROUND(SUM_TIMER_WAIT / 1000000000, 2) AS total_ms,
-  ROUND(AVG_TIMER_WAIT / 1000000, 2) AS avg_ms,
+  ROUND(AVG_TIMER_WAIT / 1000000000, 2) AS avg_ms,   -- 计时列单位是皮秒，除以 1e9 才是毫秒
   SUM_ROWS_EXAMINED AS rows_examined,
   SUM_ROWS_SENT AS rows_sent,
   SUM_NO_INDEX_USED AS no_index_used,
@@ -1377,6 +1381,8 @@ SET GLOBAL innodb_stats_persistent_sample_pages = 200;  -- 默认 20
 
 **长期方案**：对关键大表调大采样页数，并在数据批量变更后主动 `ANALYZE TABLE`（`innodb_stats_auto_recalc` 默认 `ON`，但触发条件是变更行数超过表 10%，小批量变更不会触发）。
 
+对倾斜严重、又没有索引可依靠的列，MySQL 8.0 还可以建**直方图**：`ANALYZE TABLE t_order UPDATE HISTOGRAM ON status, city WITH 64 BUCKETS;`（桶数默认 100，上限 1024），结果保存在 `information_schema.COLUMN_STATISTICS`，用 `ANALYZE TABLE t_order DROP HISTOGRAM ON status;` 删除。它只改善过滤行数的估算，不改变索引结构，也无法替代 `ANALYZE TABLE` 对索引统计的刷新。
+
 ```mermaid
 flowchart TD
   A["告警 接口 P99 突增"] --> B["确认是数据库问题还是应用问题"]
@@ -1488,7 +1494,7 @@ flowchart TD
 
 **展开（2 分钟版）**：
 
-1. 由 `optimizer_switch` 的 `index_condition_pushdown=on` 控制（默认开）；MySQL 8.0 已标记该开关废弃，行为恒开。
+1. 由 `optimizer_switch` 的 `index_condition_pushdown=on` 控制（默认开），关掉只会让回表次数变多，生产不要关。
 2. 只对**二级索引**有效，聚簇索引叶子已是整行，无"先过滤再回表"的意义。
 3. 对**覆盖索引**无意义（本来就不回表）。
 4. 举数字：`a=1` 匹配 100 万行，`b>2` 过滤到 10 万，`c=3` 只剩 100 行。无 ICP 要回表 10 万次，有 ICP 只回表 100 次。
@@ -1506,10 +1512,10 @@ flowchart TD
 
 1. 索引列上做函数或运算：`DATE(created_at) = '2025-01-01'`、`id + 1 = 100`。MySQL 8.0.13+ 可建函数索引绕过。
 2. 隐式类型转换：`VARCHAR` 列与数字比较，列被 `CAST` 成 `DOUBLE`。反方向（数字列比字符串）不影响。
-3. 字符集/排序规则不一致的 JOIN，被驱动表列必然失效。
+3. 字符集/排序规则不一致的 JOIN，被转换那一侧的列索引必然失效（见 5.3）。
 4. `LIKE '%x'` 前导通配。
 5. 联合索引跳过最左列或中间断裂（后续列只能 ICP 过滤）。
-6. `ORDER BY` 列不在索引中，或方向不一致（8.0 前）。
+6. `ORDER BY` 列不在索引中，或方向不一致且没有匹配的降序索引。
 
 **代价选择（优化器可以走但选择不走）**：
 
@@ -1547,7 +1553,7 @@ flowchart TD
 2. **看现场**：`SELECT * FROM information_schema.PROCESSLIST WHERE command <> 'Sleep'`。大量 `Sending data` 是扫描大结果集；`Waiting for table metadata lock` 是有 DDL 卡住；`Waiting for table level lock` 是 MyISAM 或备份工具。
 3. **找语句**：
    ```sql
-   SELECT DIGEST_TEXT, COUNT_STAR, ROUND(AVG_TIMER_WAIT/1000000,2) AS avg_ms,
+   SELECT DIGEST_TEXT, COUNT_STAR, ROUND(AVG_TIMER_WAIT/1000000000,2) AS avg_ms,
           SUM_ROWS_EXAMINED, SUM_ROWS_SENT, SUM_NO_INDEX_USED
    FROM performance_schema.events_statements_summary_by_digest
    ORDER BY SUM_TIMER_WAIT DESC LIMIT 10;
@@ -1609,7 +1615,7 @@ flowchart TD
 
 **排查用途**：如果预期 `key_len` 是 130，实际只有 42，说明 `b`、`c` 的条件没生效，常见原因是隐式转换、函数包裹、或前导列被范围条件截断。
 
-**追问**：为什么 `utf8mb4` 一个字符算 4 字节？答：`utf8mb4` 最大需要 4 字节表示一个字符（MySQL 8.0 默认字符集，能存 emoji）。`utf8mb3` 是 3 字节，`latin1` 是 1 字节。这也是"`utf8mb4` 索引比 `latin1` 大 4 倍"的原因——**长 `VARCHAR` 列做索引时可能超过 InnoDB 单列索引 3072 字节上限**（`DYNAMIC` 行格式、`innodb_large_prefix` 在 8.0 中已默认开启）。
+**追问**：为什么 `utf8mb4` 一个字符算 4 字节？答：`utf8mb4` 最大需要 4 字节表示一个字符（MySQL 8.0 默认字符集，能存 emoji）。`utf8mb3` 是 3 字节，`latin1` 是 1 字节。这也是"`utf8mb4` 索引比 `latin1` 大 4 倍"的原因——**长 `VARCHAR` 列做索引时可能超过 InnoDB 单列索引 3072 字节上限**（`DYNAMIC` 行格式下的上限；旧变量 `innodb_large_prefix` 已在 MySQL 8.0 中移除，行为恒为开启）。
 
 ### Q11. 为什么 `ORDER BY` 会出现 `Using filesort`？怎么优化？
 
@@ -1650,7 +1656,7 @@ flowchart TD
 1. `EXPLAIN` 输出的**第一行是驱动表**（`id` 相同时从上往下），第二行是被驱动表。
 2. 被驱动表 `type=ALL` + `Extra=Using join buffer (...)` 说明关联列没索引，这就是性能杀手，**必须先加索引**。
 3. `INNER JOIN` 的驱动顺序由优化器决定，可能重排；`LEFT JOIN` 左表一定是驱动表；`RIGHT JOIN` 右表是驱动表。
-4. **过滤条件写 `WHERE` 而不是 `ON`**。对 `LEFT JOIN`，`ON` 里针对被驱动表的条件不会减少驱动表行数；写到 `WHERE` 会把 `LEFT JOIN` 退化为 `INNER JOIN`，改变语义与驱动表选择。
+4. **过滤条件写 `ON` 还是 `WHERE` 语义不同**。对 `LEFT JOIN`，`ON` 里针对被驱动表的条件不会减少驱动表行数；写到 `WHERE` 会把 `LEFT JOIN` 退化为 `INNER JOIN`，改变语义与驱动表选择。
 5. **MySQL 8.0.18+ 的哈希连接**：等值连接且无索引时 `Extra=Using join buffer (hash join)`，复杂度 O(N+M)，比 BNL 的 O(N×M) 好得多，但要确保 `join_buffer_size`（默认 256KB）够大，否则会 grace hash join 落盘。
 6. **`STRAIGHT_JOIN` 或优化器提示 `/*+ JOIN_ORDER(...) */`** 只在明确知道数据分布时使用，参数变化后可能变差。
 7. **`DEPENDENT SUBQUERY`** 是最差形态，外层每行执行一次子查询，必须改写成 `JOIN`。
@@ -1669,7 +1675,7 @@ flowchart TD
    - 二者都追平但 `Seconds_Behind_Master` 仍大 → 主库没有新写入，或大事务在提交瞬间才更新位点。
 2. **最常见根因：大事务**。一个 `DELETE FROM huge_table WHERE ...` 删 500 万行，在从库是单线程回放（或按 `binlog_group_commit` 分组），可能跑几十分钟。**`Seconds_Behind_Master` 在大事务执行期间会显示为主库当前时间与最后提交时间之差，会突然很大。**
 3. **DDL**：`ALTER TABLE` 在从库同样要执行，大表 DDL 会把回放堵死。这也是为什么 gh-ost 要配合 `--throttle-control-replicas` 限流。
-4. **并行复制**：MySQL 5.7 起用 `slave_parallel_type` / `slave_parallel_workers`，MySQL 8.0.26 起官方术语改为 `replica_parallel_type` / `replica_parallel_workers`（旧名仍兼容）。并行粒度由 `binlog_transaction_dependency_tracking` 决定，MySQL 8.0 默认 `COMMIT_ORDER`，改成 `WRITESET`（MySQL 5.7.22 起可用）能让同一组内更多事务并行回放。**单个大事务内部无法并行**，这是主从延迟最常见的成因。
+4. **并行复制**：多线程复制从 MySQL 5.6 起提供（5.6 只有 `slave_parallel_workers`，按库并行；`slave_parallel_type` 与 `LOGICAL_CLOCK` 粒度是 MySQL 5.7 新增的），MySQL 8.0.26 起官方术语改为 `replica_parallel_type` / `replica_parallel_workers`（旧名仍兼容）。并行粒度由 `binlog_transaction_dependency_tracking` 决定，MySQL 8.0 默认 `COMMIT_ORDER`，改成 `WRITESET`（MySQL 5.7.22 起可用）能让同一组内更多事务并行回放。**单个大事务内部无法并行**，这是主从延迟最常见的成因。
 5. **排查命令**：
    ```sql
    SHOW SLAVE STATUS\G          -- 5.7；8.0 也可用 SHOW REPLICA STATUS\G
@@ -1680,7 +1686,7 @@ flowchart TD
 6. **应急**：`KILL` 从库上回放的慢 SQL 会打断复制（需谨慎）；更安全的是等它跑完，同时**立刻在主库禁止新的大事务**（改代码 / DBA 拦截）。
 7. **根治**：所有批量删除/更新**分片执行**（每批 500~1000 行 + `sleep`），DDL 走 gh-ost，`binlog_row_image=minimal`（8.0 默认 `full`）减小 binlog 体积。
 
-**追问**：`Seconds_Behind_Master` 为 0 就一定没有延迟吗？答：不一定。它是"从库当前时间 - 从库最后执行事务在 binlog 中的时间戳"，当主库停止写入时它会变成 0，但实际可能还有未回放的 relay log。更可靠的是对比 `Read_Master_Log_Pos` 与 `Exec_Master_Log_Pos`，或用 `pt-heartbeat` 打时间戳测量真实延迟。
+**追问**：`Seconds_Behind_Master` 为 0 就一定没有延迟吗？答：不一定。它是"从库当前时间 - 从库最后执行事务在 binlog 中的时间戳"，当主库停止写入时它会变成 0，而当 IO 线程没拉到最新 binlog 时它也照样显示 0（SQL 线程把已收到的老 relay log 执行完了），此时从库其实已经落后。更可靠的是对比 `Read_Master_Log_Pos` 与 `Exec_Master_Log_Pos`，或用 `pt-heartbeat` 打时间戳测量真实延迟。
 
 ### Q15. 怎么治理一张表上过多的索引？
 

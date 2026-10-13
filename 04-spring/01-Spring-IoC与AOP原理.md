@@ -29,9 +29,9 @@
 
 | 版本 | JDK 要求 | 关键变化 |
 | --- | --- | --- |
-| Spring Framework 4.x | JDK 6+ | 支持 `@Conditional`、泛型依赖注入；`spring-core` 开始内嵌 CGLIB |
+| Spring Framework 4.x | JDK 6+ | 支持 `@Conditional`、泛型依赖注入；`spring-core` 里内嵌的 CGLIB 是自 Spring 3.2 起重打包的 `org.springframework.cglib` |
 | Spring Framework 5.0 | JDK 8+ | 引入 WebFlux、`@Nullable` 注解体系、Kotlin 支持 |
-| Spring Framework 5.2 | JDK 8+ | CGLIB 重打包到 `org.springframework.cglib`，不再依赖外部 net.sf.cglib |
+| Spring Framework 5.2 | JDK 8+ | `@Configuration` 新增 `proxyBeanMethods` 属性（默认 `true`；设 `false` 即 lite 模式，不做 CGLIB 增强） |
 | Spring Framework 5.3.x | JDK 8+ | 最后一个 5.x 分支；Spring Boot 2.x 全线使用；引入 `BeanPostProcessorCache` |
 | Spring Framework 6.0 | **JDK 17+** | Java EE 迁移到 Jakarta EE 9+，包名 `javax.*` 改 `jakarta.*`，如 `jakarta.annotation.Resource` |
 | Spring Framework 6.1 | JDK 17+ | 支持 JDK 21 虚拟线程下的 `TaskExecutor` 适配 |
@@ -127,7 +127,7 @@ public void refresh() throws BeansException, IllegalStateException {
 - `this.closed.set(false)`、`this.active.set(true)`，重置状态位。
 - `initPropertySources()`：空实现，供子类插入自定义 `PropertySource`（如 Web 环境插入 `servletConfigInitParams`）。
 - `getEnvironment().validateRequiredProperties()`：校验所有 `setRequiredProperties` 声明的属性。
-- 初始化 `earlyApplicationListeners`（`LinkedHashSet`）与 `earlyApplicationEvents`（`LinkedHashSet`）。这两个集合存在的意义是：`refresh()` 早期还没有 `ApplicationEventMulticaster`，此时 `publishEvent` 的事件先攒着，第 10 步统一补发。
+- 初始化 `earlyApplicationListeners`（`LinkedHashSet`，存的是 refresh 前的监听器快照，重复 refresh 时用来把 `applicationListeners` 复位）与 `earlyApplicationEvents`（`LinkedHashSet`）。后者的意义是：`refresh()` 早期还没有 `ApplicationEventMulticaster`，此时 `publishEvent` 的事件先攒着，第 10 步统一补发。
 
 **第 2 步 `obtainFreshBeanFactory()`**
 
@@ -229,7 +229,7 @@ beanFactory.freezeConfiguration();
 beanFactory.preInstantiateSingletons();
 ```
 
-`preInstantiateSingletons()` 的逻辑：拷贝一份 `beanDefinitionNames`，逐个判断 `bd.isAbstract()`、`bd.isSingleton()`、`bd.isLazyInit()`，跳过不符合的；是 `FactoryBean` 则用 `FACTORY_BEAN_PREFIX`（即 `&`）为前缀 `getBean`；**遍历结束后**再遍历一遍所有 bean，如果是 `SmartInitializingSingleton` 就调 `afterSingletonsInstantiated()`（Spring 4.1 引入，MyBatis 的 `MapperScannerConfigurer` 与 Spring Boot 的 `WebServerStartStopLifecycle` 都用它）。
+`preInstantiateSingletons()` 的逻辑：拷贝一份 `beanDefinitionNames`，逐个判断 `bd.isAbstract()`、`bd.isSingleton()`、`bd.isLazyInit()`，跳过不符合的；是 `FactoryBean` 则用 `FACTORY_BEAN_PREFIX`（即 `&`）为前缀 `getBean`；**遍历结束后**再遍历一遍所有 bean，如果是 `SmartInitializingSingleton` 就调 `afterSingletonsInstantiated()`（Spring 4.1 引入；`EventListenerMethodProcessor`（处理 `@EventListener`）与 `CacheAspectSupport`（初始化 `CacheManager`）都实现了它——注意 `MapperScannerConfigurer` 是 `BeanDefinitionRegistryPostProcessor`、`WebServerStartStopLifecycle` 是 `SmartLifecycle`，都不走这条回调）。
 
 **第 12 步 `finishRefresh()`**
 
@@ -241,7 +241,7 @@ publishEvent(new ContextRefreshedEvent(this));
 LiveBeansView.registerApplicationContext(this);
 ```
 
-`initLifecycleProcessor()` 在 `lifecycleProcessor` bean 不存在时注册 `DefaultLifecycleProcessor`；它的 `onRefresh()` 调 `startBeans(false)`，只启动 `isAutoStartup()` 为 true 的 `SmartLifecycle`，按 `getPhase()` **升序**执行，同 phase 内按依赖顺序。`SmartLifecycle#getPhase()` 默认返回 `DEFAULT_PHASE = Integer.MAX_VALUE`；Tomcat 启动的 `WebServerStartStopLifecycle#getPhase()` 返回 `Integer.MAX_VALUE - 1`。关闭时按 phase **降序**停止，这是"先停 Web 服务器收流量，再停业务组件"的实现依据。
+`initLifecycleProcessor()` 在 `lifecycleProcessor` bean 不存在时注册 `DefaultLifecycleProcessor`；它的 `onRefresh()` 调 `startBeans(true)`（手动调 `LifecycleProcessor#start()` 才是 `startBeans(false)`，会连 `isAutoStartup()` 为 false 的也启动），只启动 `isAutoStartup()` 为 true 的 `SmartLifecycle`，按 `getPhase()` **升序**执行，同 phase 内按依赖顺序。`SmartLifecycle#getPhase()` 默认返回 `DEFAULT_PHASE = Integer.MAX_VALUE`；Tomcat 启动的 `WebServerStartStopLifecycle#getPhase()` 返回 `Integer.MAX_VALUE - 1`。关闭时按 phase **降序**停止，这是"先停 Web 服务器收流量，再停业务组件"的实现依据。
 
 ### 2.2 完整时序
 
@@ -276,9 +276,9 @@ sequenceDiagram
 
 `refresh()` 的 `try-catch` 只捕获 `BeansException` 及其子类。也就是说：
 
-- `BeanDefinitionStoreException`、`BeanCreationException`、`NoSuchBeanDefinitionException` 都会触发 `destroyBeans()`（销毁已创建的单例）与 `cancelRefresh(ex)`（把 `active` 置回 false、`closed` 置 true），然后**原样抛出**。
+- `BeanDefinitionStoreException`、`BeanCreationException`、`NoSuchBeanDefinitionException` 都会触发 `destroyBeans()`（销毁已创建的单例）与 `cancelRefresh(ex)`（只把 `active` 置回 false，`closed` 要等 `close()` 才置位），然后**原样抛出**。
 - `finally` 里的 `resetCommonCaches()` 会清掉 `ReflectionUtils`、`AnnotationUtils`、`ResolvableType`、`CachedIntrospectionResults` 的缓存，防止类加载器泄漏。
-- 只有第 11 步抛出的异常才可能是"bean 创建失败"；第 5 步抛出的一般是配置错误（如 `@Configuration` 类无法 CGLIB 增强）。
+- 第 11 步抛出的异常绝大多数是"bean 创建失败"（`BeanCreationException`）；但第 5、6 步也要 `getBean` 出 `BeanFactoryPostProcessor`、`BeanPostProcessor` 自身，它们的创建失败同样是 `BeanCreationException`。第 5 步更常见的还是配置错误（如 `@Configuration` 类无法 CGLIB 增强）。
 
 ## 三、BeanDefinition 与容器实现类族
 
@@ -325,7 +325,7 @@ sequenceDiagram
 | `XmlWebApplicationContext` | SpringMVC 传统 XML 配置 | `DefaultListableBeanFactory` |
 | `AnnotationConfigWebApplicationContext` | SpringMVC 注解配置 | `DefaultListableBeanFactory` |
 
-`AnnotationConfigApplicationContext` 的构造流程值得记：构造时 new `DefaultListableBeanFactory` + new `AnnotatedBeanDefinitionReader` + new `ClassPathBeanDefinitionScanner`；`register()` 走 `AnnotatedBeanDefinitionReader`；`scan()` 走 `ClassPathBeanDefinitionScanner`（默认扫描 `@Component`、`@ManagedBean`、`@Named`，通过 `ClassPathScanningCandidateComponentProvider#isCandidateComponent` 判断，条件是 `AnnotationMetadata#isIndependent()` 为 true，且（是具体类，或者是抽象类但带有 `@Lookup` 标注的方法），因此**静态内部类不会被扫描为候选组件**）。
+`AnnotationConfigApplicationContext` 的构造流程值得记：构造时 new `DefaultListableBeanFactory` + new `AnnotatedBeanDefinitionReader` + new `ClassPathBeanDefinitionScanner`；`register()` 走 `AnnotatedBeanDefinitionReader`；`scan()` 走 `ClassPathBeanDefinitionScanner`（默认扫描 `@Component`、`@ManagedBean`、`@Named`，通过 `ClassPathScanningCandidateComponentProvider#isCandidateComponent` 判断，条件是 `AnnotationMetadata#isIndependent()` 为 true，且（是具体类，或者是抽象类但带有 `@Lookup` 标注的方法），因此**非静态内部类（inner class）不会被扫描为候选组件，静态嵌套类（static nested class）可以**）。
 
 ## 四、BeanFactory、FactoryBean、ApplicationContext
 
@@ -358,7 +358,7 @@ public interface FactoryBean<T> {
 
 - `getBean("myFactory")` 返回的是 `getObject()` 的结果，**不是** FactoryBean 本身。
 - `getBean("&myFactory")` 才返回 FactoryBean 本身，`&` 常量是 `BeanFactory.FACTORY_BEAN_PREFIX`。
-- `isSingleton()` 在 Spring 5.2 起变成 `default` 方法，默认返回 `true`，老代码必须实现。
+- `isSingleton()` 在 Spring 5.0 起变成 `default` 方法，默认返回 `true`（5.0 之前实现类必须自己提供）；上面代码里的 `OBJECT_TYPE_ATTRIBUTE` 常量则是 5.2 新增。
 - `getObjectType()` 返回 `null` 时，`AbstractBeanFactory#getTypeForFactoryBean` 会尝试实例化 FactoryBean 来推断类型，可能触发提前初始化。
 - 与 `BeanFactoryPostProcessor` 组合时极易踩坑：`PropertySourcesPlaceholderConfigurer` 如果被 FactoryBean 引用，会提前实例化并打出 "is not eligible for getting processed by all BeanPostProcessors (for example: not eligible for auto-proxying)" 的 INFO 日志，意味着这个 bean 拿不到 `@Autowired` 与 AOP 代理。
 
@@ -394,7 +394,7 @@ Spring 4.3 起，**只有一个构造器时可省略 `@Autowired`**。多个构�
 5. 否则用 `ConstructorResolver#createArgumentArray` 逐个解析参数 `beanFactory.resolveDependency`。
 6. 参数值与形参类型做 `TypeConverter` 转换（`resolveEmbeddedValue` 先解析占位符与 SpEL）。
 
-`@Value` 也走这条路径：`DefaultListableBeanFactory#doResolveDependency` 里先 `resolveEmbeddedValue`，再 `getAutowireCandidateResolver().getSuggestedValue(descriptor)`。
+`@Value` 也走这条路径：`DefaultListableBeanFactory#doResolveDependency` 里先 `getAutowireCandidateResolver().getSuggestedValue(descriptor)` 拿到注解上的原始字符串，再 `resolveEmbeddedValue` 解析 `${}` 占位符（之后还有 `evaluateBeanDefinitionString` 处理 SpEL），最后 `converter.convertIfNecessary` 转成目标类型。
 
 ## 六、循环依赖与三级缓存
 
@@ -418,7 +418,7 @@ Spring Boot 2.6 起，**默认禁止循环依赖**：`spring.main.allow-circular
 
 ### 6.2 三个缓存到底存什么
 
-`DefaultSingletonBeanRegistry` 的四个关键字段（Spring 5.3.x）：
+`DefaultSingletonBeanRegistry` 的关键字段（Spring 5.3.x）：
 
 ```java
 private final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);
@@ -559,7 +559,7 @@ Requested bean is currently in creation: Is there an unresolvable circular refer
 | `@DependsOn` 调整顺序 | 只能改顺序，不能解开真正的环 | 环仍在则无效 |
 | 重构拆出第三方 bean | 从根上消除环 | 需要改设计，通常才是正解 |
 
-`@Lazy` 的实现细节：`buildLazyResolutionProxy` 用 `ProxyFactory` 生成代理，`TargetSource` 是匿名的，`getTarget()` 里调 `beanFactory.resolveDependency`。所以 `@Lazy` 注入的是代理，任何"对象是否已被初始化"的判断都会被绕过。
+`@Lazy` 的实现细节：`buildLazyResolutionProxy` 用 `ProxyFactory` 生成代理，`TargetSource` 是匿名的，`getTarget()` 里调 `DefaultListableBeanFactory#doResolveDependency`。所以 `@Lazy` 注入的是代理，任何"对象是否已被初始化"的判断都会被绕过。
 
 ### 6.7 @Async 触发的特例报错
 
@@ -757,7 +757,7 @@ public class TaskRunner {
 | 单例 + `ThreadLocal` 字段 | 安全但有泄漏风险 | 必须先 `remove()` |
 | prototype | 每次新对象 | 仍需自行保证对象内引用共享问题 |
 
-容器本身的并发安全：`singletonObjects` 是 `ConcurrentHashMap`；`singletonFactories` 是 `HashMap`，靠 `synchronized (this.singletonObjects)` 在 `addSingletonFactory`、`getSingleton`、`addSingleton`、`removeSingleton` 四个方法里保护。所以**创建期的容器操作是安全的，但并发 `getBean` 同一 prototype 时性能会退化到串行**。
+容器本身的并发安全：`singletonObjects` 是 `ConcurrentHashMap`；`singletonFactories` 是 `HashMap`，靠 `synchronized (this.singletonObjects)` 在 `addSingletonFactory`、`getSingleton`、`addSingleton`、`removeSingleton` 四个方法里保护。有一个容易被忽略的点：`getSingleton(beanName, ObjectFactory)` 把**整个创建过程**（`singletonFactory.getObject()`）都放在这把锁里，所以**单例的创建本质上是全局串行的**，启动期多线程 `getBean` 也快不起来——想缩短启动时间只能减少单例数量与依赖深度，或用 `spring.main.lazy-initialization` 把创建推迟到首次使用。prototype 走的是 `createBean` 直连路径，不经过这把锁。
 
 ## 九、@Autowired 与 @Resource 的匹配策略
 
@@ -768,7 +768,7 @@ public class TaskRunner {
 | 所属规范 | Spring 自有 | JSR-250（Spring 6 为 `jakarta.annotation`） |
 | 默认匹配 | **byType** | **byName**，失败再 byType |
 | 处理者 | `AutowiredAnnotationBeanPostProcessor` | `CommonAnnotationBeanPostProcessor` |
-| 可标注位置 | 构造器、字段、setter、任意方法、方法参数、注解类型（5.0+）、`@Bean` 方法的参数 | 字段、setter 方法（非 setter 会报错） |
+| 可标注位置 | 构造器、字段、setter、任意方法、方法参数、注解类型（自定义元注解）、`@Bean` 方法的参数 | 字段、任意单参数方法（静态方法或参数个数 ≠ 1 时直接抛 `IllegalStateException`，不要求是 setter） |
 | `required` 属性 | 有，默认 `true` | 无该属性 |
 | 找不到时 | 抛 `NoSuchBeanDefinitionException`（required=true） | 抛 `NoSuchBeanDefinitionException` |
 | 多实现消歧 | `@Qualifier` / `@Primary` / 变量名兜底 | `name` 属性 / 变量名 |
@@ -784,21 +784,23 @@ public class TaskRunner {
 4. 候选为 1 个：直接返回。
 5. 候选多个：`determineAutowireCandidate` 依序判断：
    - `@Primary` 标记的候选（`determinePrimaryCandidate`）唯一则选中。
-   - `Priority` 注解/`Ordered`/`@Order` 的优先级比较（`determineHighestPriorityCandidate`，Spring 5.1 起支持 `jakarta.annotation.Priority` 与 `@Order`）。
+   - `@Priority` 注解的优先级比较（`determineHighestPriorityCandidate` → `DefaultListableBeanFactory#getPriority` → `OrderComparator#getPriority`，默认实现落在 `AnnotationAwareOrderComparator#getPriority` → `OrderUtils#getPriority`，**只读 `@Priority`，不读 `Ordered`/`@Order`**，值越小优先级越高；Spring 5 读的是 `javax.annotation.Priority`，`jakarta.annotation.Priority` 是 Spring 6 的事。`Ordered`/`@Order` 不参与这里的单候选选择，只在集合注入排序时生效）。
    - 最后用**字段名/参数名**去匹配 beanName（`matchesBeanName`），这是"为什么变量名要跟 bean 名一致"的由来。
 6. 都不满足 → 抛 `NoUniqueBeanDefinitionException`。
 
-`@Qualifier` 的处理在 `findAutowireCandidates` **之前**：`resolveMultipleBeans` 之外，`QualifierAnnotationAutowireCandidateResolver#isAutowireCandidate` 会在候选过滤时按 `@Qualifier` 值匹配 bean 的 `qualifiers` 集合，也会把 beanName 当作隐式 qualifier（`checkQualifier` 里 `if (beanName.equals(qualifier))`）。
+`@Qualifier` 在候选过滤阶段就生效，不是"候选定完之后再筛"：`findAutowireCandidates` 内部对每个候选名调 `isAutowireCandidate(candidate, descriptor)`，最终落到 `QualifierAnnotationAutowireCandidateResolver#checkQualifier`，按 `@Qualifier` 值匹配 bean 的 `qualifiers` 集合；`@Qualifier("wechatService")` 的值还能直接匹配 beanName 或别名（`checkQualifier` 里的 `bdHolder.matchesName(...)` 兜底）。所以第一轮候选过滤失败时，`findAutowireCandidates` 还会用 `fallbackDescriptor` 再找一轮，但对集合注入（多候选）只有带 `@Qualifier` 才会走这轮兜底。
+
+集合注入走的是另一条分支 `DefaultListableBeanFactory#resolveMultipleBeans`：`@Autowired List<PayService>`、`PayService[]`、`Set<PayService>` 会把**所有**候选都注入进来，不做"多实现消歧"；`List` 与数组会按 `dependencyComparator`（注解驱动容器在 `AnnotationConfigUtils` 里设成 `AnnotationAwareOrderComparator`）排序，所以 **`@Order`/`Ordered` 真正起作用的地方是这里**；`Map<String, PayService>` 的 key 是 beanName，不做排序。想要"只注入一个"而不是全部，仍然要先靠 `@Primary` 或 `@Qualifier` 把候选过滤到唯一。
 
 ### 9.3 @Resource 的解析顺序
 
 `CommonAnnotationBeanPostProcessor#buildResourceMetadata` → `ResourceElement#getResourceToInject`：
 
-1. 若指定了 `name` → `beanFactory.getBean(name)`。
-2. 否则若 `isDefaultName` 为 false（说明显式设了 `type`） → 按类型 `resolveDependency`。
-3. 否则（既没 name 也没 type）：先按字段名/属性名 `getBean(name)`，**`BeansException` 被吞掉**后回退按类型解析。
+1. 显式写了 `name`（此时 `isDefaultName` 为 false）→ 交给 `resolveBeanByName(name, descriptor)`，即 `getBean(name, 期望类型)`。
+2. 没写 `name`（`isDefaultName` 为 true）且字段名/属性名**不是**容器里的 bean 名（`!factory.containsBean(name)`）→ 按类型 `resolveDependency` 兜底，`type` 属性或字段类型在这里生效。
+3. 没写 `name` 且字段名正好是 bean 名 → 按名字解析，类型不符会抛 `BeanNotOfRequiredTypeException`，**没有"名字找不到就静默回退类型"的 try-catch**。
 
-所以 `@Resource` 的语义是"按名字优先，找不到再按类型"，且**名字来自字段名**。`@Resource(name = "orderServiceA")` 是显式指定。
+所以 `@Resource` 的语义是"先按名字（显式 `name`，否则字段名/属性名），这个名字在容器里不存在时才按类型"，即 byName → byType。`@Resource(name = "orderServiceA")` 是显式指定。
 
 ### 9.4 三个注解的配合
 
@@ -879,7 +881,7 @@ else {
 | --- | --- | --- |
 | 实现方式 | 实现目标接口，生成 `$Proxy0` | 生成目标类的子类，重写非 final 方法 |
 | 前置条件 | 目标必须实现接口 | 目标类非 final，方法非 final/private |
-| 依赖 | `java.lang.reflect.Proxy` + `InvocationHandler` | `org.springframework.cglib`（Spring 5.2 起重打包） |
+| 依赖 | `java.lang.reflect.Proxy` + `InvocationHandler` | `org.springframework.cglib`（Spring 3.2 起重打包在 `spring-core` 里） |
 | 拦截范围 | 仅接口声明的方法 | 所有可重写方法（含 protected） |
 | 创建速度 | 快 | 慢（需生成 ASM 字节码并定义类） |
 | 调用速度 | JDK 8 起经 MethodHandle 优化，接近 CGLIB | 直接 invokevirtual，通常更快 |
@@ -937,7 +939,7 @@ flowchart TD
 | `final` 类 | CGLIB 抛 `IllegalArgumentException: Cannot subclass final class` | 去掉 final 或抽出接口用 JDK 代理 |
 | `static` 方法 | 与实例无关，代理无法拦截 | 把逻辑移到实例方法 |
 | 手动 `new` 的对象 | 不经容器，无代理 | 从容器 `getBean` 获取 |
-| `@Transactional` 在非 public 方法上 | `AnnotationTransactionAttributeSource` 的 `publicMethodsOnly` 默认 true，非 public 直接不符合，静默无视 | 改 public；或 `setPublicMethodsOnly(false)` |
+| `@Transactional` 在非 public 方法上 | `AnnotationTransactionAttributeSource` 的 `publicMethodsOnly` 默认 true，非 public 直接不符合，静默无视 | 改 public；要支持非 public 只能换掉 `TransactionAttributeSource`（`new AnnotationTransactionAttributeSource(false)`，该字段是 final，**没有 setter**） |
 | `@Transactional` 异常被 `catch` 后未抛出 | 事务拦截器看不到异常 | 手动 `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()` |
 | `@Transactional` 捕获了非 `RuntimeException` | 默认只对 `RuntimeException` 和 `Error` 回滚 | 加 `rollbackFor = Exception.class` |
 | 切点表达式写错 | 不匹配任何方法 | 打开 `logging.level.org.springframework.aop=TRACE` 看 `Pointcut` 匹配日志 |
@@ -952,7 +954,7 @@ flowchart TD
 
 | 方案 | 写法 | 优点 | 缺点 |
 | --- | --- | --- | --- |
-| `AopContext.currentProxy()` | `((UserService) AopContext.currentProxy()).doTx()` | 不改结构 | 需 `exposeProxy=true`，ThreadLocal 有开销，非代理环境报错 |
+| `AopContext.currentProxy()` | `((UserService) AopContext.currentProxy()).doTx()` | 不改结构 | 需 `exposeProxy=true`，ThreadLocal 有开销，非代理环境报错；它存的是 `NamedThreadLocal`，**`@Async`/线程池里拿不到**（要手动把代理对象传进去） |
 | 注入自身 | `@Autowired @Lazy private UserService self;` | 代码显式 | 需 `@Lazy` 否则循环依赖 |
 | `ObjectProvider` | `provider.getObject().doTx()` | 无循环依赖风险 | 代码冗长 |
 | 拆分 bean | 把事务方法放到 `TxService` | **最干净** | 需要重构 |
@@ -1010,7 +1012,7 @@ sequenceDiagram
 | REQUIRES_NEW | `PROPAGATION_REQUIRES_NEW` | 3 | 总是新建，挂起旧事务 |
 | NOT_SUPPORTED | `PROPAGATION_NOT_SUPPORTED` | 4 | 挂起旧事务，非事务执行 |
 | NEVER | `PROPAGATION_NEVER` | 5 | 有事务则抛异常 |
-| NESTED | `PROPAGATION_NESTED` | 6 | 保存点（savepoint），仅 `DataSourceTransactionManager` 支持 |
+| NESTED | `PROPAGATION_NESTED` | 6 | 保存点（savepoint）；需事务管理器允许嵌套（`AbstractPlatformTransactionManager#nestedTransactionAllowed` 默认 false，`DataSourceTransactionManager`、`JtaTransactionManager` 在构造器里就置 true，所以不是只有前者支持），且只有 `useSavepointForNestedTransaction()` 为 true（默认，JTA 为 false）时才是真正的 savepoint 嵌套 |
 
 隔离级别：`ISOLATION_DEFAULT = -1`、`READ_UNCOMMITTED = 1`、`READ_COMMITTED = 2`、`REPEATABLE_READ = 4`、`SERIALIZABLE = 8`。`TIMEOUT_DEFAULT = -1`。
 
@@ -1034,7 +1036,7 @@ public boolean rollbackOn(Throwable ex) {
 
 1. `getCacheOperationMetadata` 解析注解为 `CacheOperationMetadata`。
 2. `generateKey`：默认 `SimpleKeyGenerator`。规则是**无参用 `SimpleKey.EMPTY`；单参且非数组直接用该参数；多参用 `SimpleKey`（`Arrays.deepHashCode`）**。
-3. `Cache#get(key)` 命中则直接返回（`unless` 条件再判断一次）。
+3. `Cache#get(key)` 命中则直接返回——`unless` 不在命中路径上判断，它只决定"结果要不要写进缓存"（`CacheOperationContext#canPutToCache`）。
 4. 未命中执行目标方法，再 `Cache#put(key, result)`。
 5. `@CacheEvict` 的 `beforeInvocation` 默认 `false`，即**方法成功后才清除**；设为 `true` 则调用前清除。
 
@@ -1046,7 +1048,7 @@ public boolean rollbackOn(Throwable ex) {
 - `@Cacheable` 与 `@CacheEvict` 写在同一方法上，`@CacheEvict` 会在方法返回后才生效，导致"先查后删"的窗口期返回旧值。
 - key 用了带时间戳或随机数的参数 → 缓存永不命中。
 - 缓存对象未实现 `Serializable`（Redis 序列化器为 `JdkSerializationRedisSerializer` 时）→ 抛 `SerializationException`。
-- 空值穿透：用 `@Cacheable(cacheNames="x", unless="#result == null")` 反而不会缓存 null，需要 `@Cacheable(cacheNames="x", key="...")` 配合 `cacheManager` 的空值策略。
+- 空值穿透：`unless = "#result == null"` 会让 null 结果永远不写缓存，命中率再高也挡不住"每次查不到都打数据库"；要缓存空值就不要加 `unless`，并确认所用的 `CacheManager` 没有禁用空值缓存。
 
 ### 12.3 @Async 的装配链
 
@@ -1079,7 +1081,7 @@ public boolean rollbackOn(Throwable ex) {
 
 `PriorityOrdered` 继承 `Ordered`，语义差异：`PriorityOrdered` 是"分组级"最先，`Ordered` 是"组内排序"。所以排序是两层：先按 `PriorityOrdered` → `Ordered` → 其余，再在组内按 `getOrder()` 升序。
 
-`Ordered` 的常用值：`Ordered.HIGHEST_PRECEDENCE = Integer.MIN_VALUE`、`Ordered.LOWEST_PRECEDENCE = Integer.MAX_VALUE`。注解侧是 `@Order`，`OrderComparator` 处理，`AnnotationAwareOrderComparator` 额外读 `@Order`。
+`Ordered` 的常用值：`Ordered.HIGHEST_PRECEDENCE = Integer.MIN_VALUE`、`Ordered.LOWEST_PRECEDENCE = Integer.MAX_VALUE`。注解侧是 `@Order`：`OrderComparator` 只认 `Ordered` 接口，`AnnotationAwareOrderComparator` 才额外读 `@Order`（`findOrder`）与 `@Priority`（`getPriority`）——注解驱动的容器在 `AnnotationConfigUtils#registerAnnotationConfigProcessors` 里把 `dependencyComparator` 设成了它。
 
 已知的具体值（Spring 5.3.x）：
 
@@ -1157,7 +1159,7 @@ app.setApplicationStartup(new BufferingApplicationStartup(2048));
 app.run(args);
 ```
 
-`BufferingApplicationStartup` 的容量参数是**步数**（默认 4096），超过会丢弃最早的记录。
+`BufferingApplicationStartup` 的容量参数是**步数**，必须显式传入（没有默认值）；容量用满后**新的 `StartupStep` 不再被记录**（已缓存的不会丢），再用 `drainBufferedTimeline()` 取出。
 
 ### 14.2 循环依赖排查
 
@@ -1285,9 +1287,9 @@ System.out.println(Arrays.toString(AopUtils.getTargetClass(bean).getInterfaces()
 
 **答题框架（30 秒版）**：`DefaultAopProxyFactory#createAopProxy` 判断 `config.isOptimize() || config.isProxyTargetClass() || hasNoUserSuppliedProxyInterfaces(config)`；若成立且目标类不是接口也不是已有代理类，用 `ObjenesisCglibAopProxy`，否则用 `JdkDynamicAopProxy`。`ProxyConfig#proxyTargetClass` 默认 false，但 **Spring Boot 2.x 的 `AopAutoConfiguration` 通过 `matchIfMissing = true` 把 `spring.aop.proxy-target-class` 默认设为 true**，所以 Boot 2.x 默认走 CGLIB。
 
-**展开（2 分钟版）**：给对比表的 8 个维度；说明 JDK 代理只能拦接口方法、CGLIB 不能拦 final/private/static；说明 Spring 5.2 起 CGLIB 重打包到 `org.springframework.cglib`；说明 CGLIB 创建慢、调用快，且会额外占用元空间。
+**展开（2 分钟版）**：给对比表的 8 个维度；说明 JDK 代理只能拦接口方法、CGLIB 不能拦 final/private/static；说明 `org.springframework.cglib` 是 Spring 3.2 起重打包进 `spring-core` 的（不是 5.2）；说明 CGLIB 创建慢、调用快，且会额外占用元空间。
 
-**追问**：接口上有 `@Transactional`，实现类上没有，能生效吗？答：用 JDK 代理时能生效（代理的是接口方法），但 Spring 官方建议注解写在实现类上，因为 CGLIB 代理时接口上的注解会被 `AnnotationTransactionAttributeSource` 通过 `specificMethod` 机制兜底查找到，容易产生"看起来生效但其实走的是另一条路径"的困惑。
+**追问**：接口上有 `@Transactional`，实现类上没有，能生效吗？答：**只有 JDK 代理时生效**。`AbstractFallbackTransactionAttributeSource#computeTransactionAttribute` 先查 `specificMethod`（最具体的方法），只有 `specificMethod != method` 时才回退去查原始方法与其声明类；JDK 代理传进来的 `method` 是接口方法，能回退找到接口上的注解，而 CGLIB 代理传进来的就是实现类方法，`specificMethod == method`，接口上的注解根本查不到。所以官方建议注解写在实现类上。
 
 ### Q7. AOP 有哪些失效场景？自调用怎么解决？
 
@@ -1295,7 +1297,7 @@ System.out.println(Arrays.toString(AopUtils.getTargetClass(bean).getInterfaces()
 
 **展开（2 分钟版）**：按第 11.1 节的决策流程图逐层讲；补充 `exposeProxy` 的实现是 `JdkDynamicAopProxy#invoke` 与 `CglibAopProxy.DynamicAdvisedInterceptor#intercept` 里的 `AopContext.setCurrentProxy(proxy)`；补充 `AnnotationTransactionAttributeSource` 的 `publicMethodsOnly` 默认 true。
 
-**追问**：`protected` 方法上的 `@Transactional` 用 CGLIB 能生效吗？答：技术上 CGLIB 能重写 protected 方法，但事务属性的获取仍然被 `publicMethodsOnly` 挡住，所以实际不生效。要生效必须 `setPublicMethodsOnly(false)`。
+**追问**：`protected` 方法上的 `@Transactional` 用 CGLIB 能生效吗？答：技术上 CGLIB 能重写 protected 方法，但事务属性的获取仍然被 `publicMethodsOnly` 挡住，所以实际不生效。要生效只能换掉默认的 `TransactionAttributeSource`（`new AnnotationTransactionAttributeSource(false)`，该字段是 final，没有 setter）。
 
 ### Q8. 场景题：线上发现某个 `@Transactional` 方法抛异常后数据没回滚，怎么排查？
 
@@ -1329,7 +1331,7 @@ System.out.println(Arrays.toString(AopUtils.getTargetClass(bean).getInterfaces()
 
 **答题框架（30 秒版）**：`BeanFactory` 是 IoC 容器根接口；`FactoryBean` 是一种特殊的 bean，用来生产其他 bean；`ApplicationContext` 是面向应用的门面，继承 `ListableBeanFactory`，额外提供国际化、事件、资源加载、Aware 自动注入，并且默认预实例化单例。
 
-**展开（2 分钟版）**：给第 4.1 节的对比表；讲 `getBean("x")` 与 `getBean("&x")` 的区别（`BeanFactory.FACTORY_BEAN_PREFIX = "&"`）；讲 `FactoryBean#isSingleton()` 在 5.2 起有 default 实现返回 true；举 `SqlSessionFactoryBean`、`MapperFactoryBean`、`ProxyFactoryBean` 的例子。
+**展开（2 分钟版）**：给第 4.1 节的对比表；讲 `getBean("x")` 与 `getBean("&x")` 的区别（`BeanFactory.FACTORY_BEAN_PREFIX = "&"`）；讲 `FactoryBean#isSingleton()` 在 5.0 起有 default 实现返回 true；举 `SqlSessionFactoryBean`、`MapperFactoryBean`、`ProxyFactoryBean` 的例子。
 
 **追问**：`getObjectType()` 返回 null 会怎样？答：`AbstractBeanFactory#getTypeForFactoryBean` 会尝试实例化 FactoryBean 来推断类型，可能触发提前初始化并打出 "not eligible" 日志。
 
@@ -1337,9 +1339,9 @@ System.out.println(Arrays.toString(AopUtils.getTargetClass(bean).getInterfaces()
 
 **答题框架（30 秒版）**：`@Autowired` 默认 byType，`@Resource` 默认 byName（失败回退 byType）；前者由 `AutowiredAnnotationBeanPostProcessor` 处理，后者由 `CommonAnnotationBeanPostProcessor` 处理；前者有 `required` 属性，默认 true。多个实现类时，`@Qualifier` 在候选过滤阶段就生效，优先级高于 `@Primary`，两者都没有时按字段名匹配 beanName。
 
-**展开（2 分钟版）**：讲 `DefaultListableBeanFactory#doResolveDependency` 的六步解析；讲 `determineAutowireCandidate` 的 `@Primary` 与 `Priority`/`Ordered` 兜底；讲 `@Resource` 的 `ResourceElement#getResourceToInject` 三种分支（显式 name → 显式 type → 字段名优先）。
+**展开（2 分钟版）**：讲 `DefaultListableBeanFactory#doResolveDependency` 的六步解析；讲 `determineAutowireCandidate` 的 `@Primary` 与 `@Priority` 兜底（`Ordered`/`@Order` 不参与这两个分支）；讲 `@Resource` 在 `CommonAnnotationBeanPostProcessor#autowireResource` 里的两个分支（显式 `name` 或字段名命中 beanName → 按名字 `resolveBeanByName`；字段名不是 beanName → 按类型 `resolveDependency`）。
 
-**追问**：`@Autowired` 能加在 `@Bean` 方法的参数上吗？答：能，5.0 起支持将 `@Autowired` 标注在注解类型上，`@Bean` 方法参数通过 `resolveDependency` 走同一条解析路径。
+**追问**：`@Autowired` 能加在 `@Bean` 方法的参数上吗？答：能，`@Bean` 方法的参数由 `ConstructorResolver#createArgumentArray` 逐个调 `resolveDependency` 解析，与字段注入走同一条路径。顺带一提，"`@Autowired` 能标在注解类型上（自定义元注解）"与 5.0 无关——`@Target` 自 3.2 起就含 `ANNOTATION_TYPE`。
 
 ### Q12. `BeanPostProcessor` 和 `BeanFactoryPostProcessor` 有什么区别？
 

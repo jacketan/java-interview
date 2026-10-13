@@ -50,7 +50,7 @@
 
 - 数据量 < 单机内存、QPS 靠读写分离能撑住 → **哨兵**。
 - 数据量超过单机内存，或写 QPS 超过单机上限 → **Cluster**。
-- 只做缓存、能容忍故障期间短暂不可用 → 可以只用**主从 + 客户端双写/多写 Sentinel 感知**，但生产上仍建议上哨兵。
+- 只做缓存、能容忍故障期间短暂不可用 → 可以只用**主从，靠客户端感知故障后人工切换**，但生产上仍建议上哨兵。
 
 ### 1.3 高可用全景图
 
@@ -129,7 +129,7 @@ flowchart TD
 
 从库发 `PSYNC <master_replid> <offset>` 后，主库必须同时满足：
 
-1. 携带的 `replid` 等于主库当前的 `server.replid`（Redis 5.0 起还支持 `master_replid2`，用于主从角色切换后的再利用）；
+1. 携带的 `replid` 等于主库当前的 `server.replid`（PSYNC2 起还支持 `master_replid2`，用于主从角色切换后的再利用）；
 2. 从库的 `offset` 落在主库 backlog 的有效区间 `[repl_backlog_off, master_repl_offset]` 内；
 3. 从库 offset 对应的数据仍在缓冲区中未被环形覆盖。
 
@@ -255,7 +255,7 @@ stateDiagram-v2
 | quorum | 配置文件 `sentinel monitor mymaster 127.0.0.1 6379 2` 的最后一个参数 | 多少票判客观下线 | 需要 quorum 票，**不要求过半** |
 | majority | `(sentinel 总数 / 2) + 1` | 选举 Leader 需要多少票 | **必须过半** |
 
-**quorum 与 majority 不是一回事**：quorum 决定"要不要开始故障转移"，majority 决定"谁来执行"。3 个哨兵、quorum=2 时，如果挂了 2 个哨兵，只剩 1 个哨兵虽然能靠自己的票 + 谁都联系不上达到 quorum 判定 ODOWN，但拿不到 majority（需要 2 票），于是故障转移失败。这是生产上"主库挂了但没切换"的经典原因。
+**quorum 与 majority 不是一回事**：quorum 决定"要不要开始故障转移"，majority 决定"谁来执行"。3 个哨兵、quorum=2 时，如果挂了 2 个哨兵，剩下的 1 个哨兵只能算自己这 1 票——其他哨兵的赞成票一旦停止刷新就不再计入，所以它连 quorum 都凑不齐，判不出 ODOWN；即便把 quorum 配成 1 判出了 ODOWN，它也拿不到 majority（需要 2 票）去选举 Leader。两道门槛任意一道过不去，故障转移都不会执行。这是生产上"主库挂了但没切换"的经典原因。
 
 ### 3.3 故障转移的完整时序
 
@@ -286,6 +286,15 @@ sequenceDiagram
   S1->>C: 通过 +switch-master 频道发布新主库地址
   C->>RA: 后续写请求路由到新主库
 ```
+
+切换的快慢与代价由两个 per-master 配置决定，面试常被追问：
+
+| 配置 | 默认值 | 作用 |
+| --- | --- | --- |
+| `sentinel failover-timeout` | 180000 ms | 故障转移各阶段的超时窗口：等待从库被提升、等待其余从库重挂新主库、等待旧主库降级为从库都用它；同一个 master 短时间内的重复 failover 也由它节流。调小切换更快，但在慢环境里容易失败重试；调大则一次切换的窗口更长 |
+| `sentinel parallel-syncs` | 1 | 故障转移过程中，同时允许几个从库被重新指向新主库。默认 1 是逐个重挂：新主库同一时刻只承受一个从库的同步压力，也避免所有从库同时不可用；重挂走 PSYNC，多数情况能借旧 replid 做部分重同步（`master_replid2`），offset 超出 backlog 窗口才退化为全量。调大能更快把从库挂回，代价是新主库的磁盘与网络可能被同时打满 |
+
+这两个值写在 `sentinel.conf` 里（形如 `sentinel parallel-syncs mymaster 1`），并且是**每个 master 一组**，不是全局值。
 
 ### 3.4 选新主库的排序规则
 
@@ -347,14 +356,16 @@ slot = CRC16(key) mod 16384
 
 CRC16 用的是 XMODEM 变体。`CLUSTER KEYSLOT <key>` 可以直接查询某个 key 落在哪个槽。
 
-**Hash Tag 机制**：如果 key 中包含 `{...}`，且 `{` 与 `}` 之间至少有一个字符，则只对花括号内的内容做 CRC16。
+**Hash Tag 机制**：取 key 中**第一个 `{`** 与其**右侧第一个 `}`** 之间的内容做 CRC16；若没有 `{`、`{` 右侧没有 `}`，或两者紧邻（内容为空），则**整个 key 参与 CRC16**——不会跳过空花括号去匹配后面的 `{...}`。
 
 | key | 实际参与哈希的部分 | 用途 |
 | --- | --- | --- |
 | `user:1001:name` | 整个字符串 | 普通键 |
 | `{user:1001}:name` | `user:1001` | 与下面的键落到同一槽 |
 | `{user:1001}:order` | `user:1001` | 可以与上一条做 `MGET` |
-| `{}` 或 `{a}{b}` | 整个字符串，回退 | 前者花括号内为空，后者取第一对 |
+| `{}` | 整个字符串，回退 | 花括号内为空，等于没写 tag |
+| `{}{a}` | 整个字符串，回退 | 第一个 `{` 紧邻 `}`，内容为空 → 整体回退，后面的 `{a}` 不会被采用 |
+| `{a}{b}:x` | `a` | 取**第一个 `{` 到其后第一个 `}` 之间**的内容，后面的 `{b}` 被忽略 |
 
 Hash tag 是**唯一能让多 key 操作在 Cluster 中工作**的手段，代价是数据倾斜：同一个 tag 的所有键都落在同一个节点，热点无法分散。
 
@@ -462,7 +473,7 @@ CLUSTER COUNTKEYSINSLOT 5000
 | 只有 db 0 | `SELECT 1` 报错 `ERR SELECT is not allowed in cluster mode` | 用 key 前缀区分环境，不要用多库 |
 | 多 key 必须同槽 | `MGET k1 k2` 跨槽报 `CROSSSLOT Keys in request don't hash to the same slot` | 用 hash tag，或客户端拆分多次调用 |
 | 多 key 命令不能跨节点 | `MSET`、`SUNION`、`ZINTERSTORE`、`BITOP`、`PFCOUNT`（多 key）均受限 | 同 tag 或降级为逐 key |
-| Lua 脚本中所有 key 必须同槽 | Redis 7.0 起明确强制校验，跨槽直接报错 | 脚本内使用 hash tag |
+| Lua 脚本中所有 key 必须同槽 | Cluster 模式下强制校验，跨槽直接报错 | 脚本内使用 hash tag |
 | 不支持跨槽事务 | `MULTI` 中若含跨槽 key，`EXEC` 报错 | 用 Lua 脚本 + hash tag |
 | `KEYS`/`SCAN` 只扫本节点 | 结果不完整 | 用 `redis-cli --cluster call` 逐节点扫，或用 `SCAN` 遍历后聚合 |
 | Pub/Sub 是全局广播 | 消息广播到所有节点，浪费带宽 | Redis 7.0 起用 `SSUBSCRIBE`/`SPUBLISH` 分片 Pub/Sub |
@@ -474,7 +485,11 @@ CLUSTER COUNTKEYSINSLOT 5000
 
 ### 4.6 集群故障转移与手动切换
 
-集群内的从库提升由集群自身完成（不需要哨兵），流程见 4.2 的 Gossip 图。手动操作：
+集群内的从库提升由集群自身完成（不需要哨兵），流程见 4.2 的 Gossip 图。
+
+自动切换不是"所有从库一起抢"：主库被标记 `FAIL` 后，它的从库各自等一段随机延迟再发起选举，**偏移量排名越靠前（数据越新）的从库等待越短**，从而让最新的从库最可能先拿到多数票当选。这套排名机制只保证"尽量挑最新的"，并不改变复制本身是异步的——所以集群切换同样可能丢掉最后几条还没同步过去的写入。
+
+手动操作：
 
 ```bash
 # 在从库上执行 强制其主库切换为从库 该从库升级为主库
@@ -799,6 +814,8 @@ flowchart LR
 3. 数据是否涉及金额、库存扣减？涉及 → 不走"缓存 + DB"的一致性方案，用 Redis 原子操作 + 异步对账，或直接读主库。
 4. 是否已有 CDC 基础设施？有 → 直接上 Canal 方案，最干净。
 
+**所有方案都缺不了 TTL 兜底**：删除动作可能因为网络抖动、MQ 消息丢失、消费者宕机而没执行，能"自愈"的只有过期时间。所以任何"永不过期"的缓存都必须配一个兜底 TTL（或定时全量对账刷新）；反过来，如果业务连"最坏情况下陈旧到 TTL 到期"这个窗口都不能接受，那这个场景就不该用缓存。
+
 ## 七、热点 key 与多级缓存
 
 ### 7.1 热点 key 的三种形态
@@ -809,7 +826,7 @@ flowchart LR
 | 写热点 | 大 V 发帖计数、库存扣减 | 单分片写 QPS 瓶颈 | `INFO commandstats` 看 `cmdstat_incr` 的 `usec_per_call` |
 | 大 key | 10 万成员的 HASH、50 万元素的 ZSET | 单次操作阻塞、`DEL` 卡住、迁移失败 | `redis-cli --bigkeys`、`MEMORY USAGE key`、`DEBUG OBJECT key` 的 `serializedlength` |
 
-大 key 是热点问题里最容易被忽视的一类。Redis 是单线程处理命令的（7.0 起 `io-threads` 可多线程处理网络 IO，但命令执行仍是单线程），一个 `HGETALL` 返回 10 万字段会阻塞整个实例数百毫秒。
+大 key 是热点问题里最容易被忽视的一类。Redis 是单线程处理命令的（6.0 起 `io-threads` 可多线程处理网络 IO，但命令执行仍是单线程），一个 `HGETALL` 返回 10 万字段会阻塞整个实例数百毫秒。
 
 **大 key 的阈值经验值**：String > 10KB、集合元素数 > 5000、集合总大小 > 1MB，就该考虑拆分。
 
@@ -873,7 +890,7 @@ Caffeine 的关键参数与默认行为：
 | `initialCapacity` | 初始容量 | 16 |
 | 淘汰算法 | W-TinyLFU（Window + SLRU 主区 + 频率草图） | 固定，不可切换 |
 
-**热点数据在 Caffeine 里必须用 `expireAfterWrite` 而不是 `refreshAfterWrite`**，或者两者配合：`expireAfterWrite` 保证最终刷新，`refreshAfterWrite` 让刷新过程不阻塞读。
+**热点数据在 Caffeine 里推荐 `refreshAfterWrite` + `expireAfterWrite` 配合**：`refreshAfterWrite` 到期后的刷新是异步的，只有一个线程去加载，其余线程直接拿旧值不被阻塞（天然防击穿）；`expireAfterWrite` 设得长一些作为兜底，保证数据最终一定会被真正重新加载。
 
 ### 7.3 多级缓存的失效传播
 
@@ -1012,7 +1029,7 @@ PEXPIRE lock:order:1001 30000
 
 1. 记录起始时间 `T1`。
 2. 依次向 N 个节点用相同 key/value 加锁，每次设置**较短的超时**（远小于锁的有效期），避免在单个节点上耗尽时间。
-3. 统计成功加锁的节点数，**大于等于 `N/2 + 1`（majority）**且总耗时小于锁有效期，才算加锁成功。
+3. 统计成功加锁的节点数，<strong>大于等于 `N/2 + 1`（majority）</strong>且总耗时小于锁有效期，才算加锁成功。
 4. 计算锁的**实际有效时间 = 初始有效期 - 加锁总耗时**。
 5. 失败则向所有节点发送释放请求（包括没加成功的节点）。
 
@@ -1061,7 +1078,7 @@ stateDiagram-v2
 | --- | --- | --- | --- | --- | --- |
 | `SET NX PX` + Lua 释放 | 单节点 | 否 | 否 | 需自旋 | 简单幂等控制 |
 | Redisson `RLock`（单节点） | 单节点 | 是 | 是（看门狗） | `tryLock` 带 waitTime | **生产主流** |
-| Redisson `RedissonMultiLock` | 多节点多数派/全部 | 是 | 是 | 是 | 跨机房跨集群 |
+| Redisson `RedissonMultiLock` | 多节点（全部加锁成功才算成功） | 是 | 是 | 是 | 跨机房跨集群 |
 | 数据库唯一索引 | DB 强 | 否 | 靠事务 | 靠 `FOR UPDATE` | 正确性要求最高的场景 |
 | ZooKeeper 临时顺序节点 | 强（ZAB） | 否 | 靠会话 | 是（Watch 通知） | 需要严格顺序与队列语义 |
 | etcd Lease + Revision | 强（Raft） | 否 | 靠 KeepAlive | 是 | Go 生态，Java 侧少用 |
@@ -1092,7 +1109,7 @@ UNWATCH      -- 取消所有监视
 | 网络开销 | 每条命令一个 RTT（可 pipeline 优化） | 一次 RTT 完成全部逻辑 |
 | 错误处理 | 运行期错误不回滚，继续执行 | 脚本内可 `redis.pcall` 捕获 |
 | 阻塞风险 | 命令都很短，风险低 | 脚本写死循环会阻塞整个实例 |
-| 集群支持 | 所有 key 必须同槽 | 所有 key 必须同槽（Redis 7.0 强制） |
+| 集群支持 | 所有 key 必须同槽 | 所有 key 必须同槽（Cluster 模式强制） |
 | 调试 | 简单 | 需 `redis-cli --eval`、`SCRIPT DEBUG` |
 
 **结论：需要条件的用 Lua，纯批量的用 pipeline 或 MULTI。**
@@ -1114,7 +1131,7 @@ return 1
 
 必须遵守：
 
-1. **只通过 `KEYS` 和 `ARGV` 传参，不要在脚本里拼接 key 字符串**。原因：Cluster 需要在执行前根据 `KEYS` 判断所有 key 是否同槽；动态拼接的 key 无法被静态分析，Redis 7.0 起会直接拒绝。
+1. **只通过 `KEYS` 和 `ARGV` 传参，不要在脚本里拼接 key 字符串**。原因：Cluster 需要在执行前根据 `KEYS` 判断所有 key 是否同槽；动态拼接的 key 无法被静态分析，一旦落到别的槽就会被拒绝执行。
 2. **`redis.call` vs `redis.pcall`**。前者出错会中断脚本并向上抛错，后者返回一个包含 `err` 字段的 table，脚本可继续。生产脚本应优先用 `pcall` 做容错。
 3. **不要用 `KEYS`、`SMEMBERS` 等 O(N) 命令**。脚本阻塞实例期间，所有客户端都在等。
 4. **确定性**。`redis.replicate_commands()` 在 Redis 3.2 引入、5.0 起成为默认（Effect Replication），此后脚本里的随机命令（`SPOP`、`TIME`、`RANDOMKEY`）会按实际操作效果复制，不再是问题。但**脚本里不要用 `os.time()`、`math.random` 做业务决策**，主从/主备会不一致。
@@ -1268,7 +1285,7 @@ redis-cli --scan --pattern "product:*" --count 1000 | head -20 | xargs -I{} redi
 
 ### 10.5 事故五：哨兵脑裂导致写入丢失
 
-**现象**：机房网络抖动 40 秒，哨兵完成故障转移把刷库到新主库；网络恢复后旧主库上的 2000 条写入消失。
+**现象**：机房网络抖动 40 秒，哨兵完成故障转移，把从库提升为新主库；网络恢复后旧主库上的 2000 条写入消失。
 
 **根因**：旧主库在分区期间仍接受写入（`min-replicas-to-write` 默认 0，即关闭）；恢复后被 `REPLICAOF` 到新主库，触发全量复制，本地数据被清空。
 
@@ -1311,7 +1328,7 @@ redis-cli memory usage 疑似大key名
 | Cluster 用 16384 槽 | 心跳位图 2048 字节，节点数可到 1000 | 一致性哈希（无法方便地做人工槽位调度与迁移） |
 | 缓存删除而非更新 | 删除幂等、惰性加载、避免并发写乱序 | 更新缓存（并发乱序导致永久脏数据） |
 | Redis 事务不回滚 | 运行期错误是编程错误，回滚代价高 | 完整事务（性能与复杂度不可接受） |
-| 单线程执行命令 | 无锁、无上下文切换、原子性天然成立 | 多线程命令执行（需大量锁，实测无收益，7.0 只多线程化了 IO） |
+| 单线程执行命令 | 无锁、无上下文切换、原子性天然成立 | 多线程命令执行（需大量锁，实测无收益，6.0 起只把网络 IO 多线程化了） |
 
 ### 11.2 线上出问题怎么定位？
 
@@ -1363,7 +1380,7 @@ redis-cli memory usage 疑似大key名
 4. 选新主库顺序：过滤 `priority = 0` 和长时间断开的，按 `slave_priority` 升序（默认 100）、`slave_repl_offset` 降序、`runid` 字典序升序。
 5. 执行：新主库 `REPLICAOF NO ONE`，其余从库 `REPLICAOF` 新主库，旧主库降级，通过 `+switch-master` 频道通知客户端。
 
-**追问**：3 个哨兵挂 2 个还能切换吗？答：不能。剩下的 1 个虽然能靠自己的票达到 quorum=2 判定 ODOWN，但拿不到 majority=2 的选举票，故障转移不执行。
+**追问**：3 个哨兵挂 2 个还能切换吗？答：不能。quorum=2 时剩下的 1 个哨兵只有自己 1 票，连 ODOWN 都判不出来；即便判出了 ODOWN，也拿不到 majority=2 的选举票，故障转移不执行。
 
 ### Q3. Redis Cluster 的 MOVED 和 ASK 重定向有什么区别？
 
@@ -1469,7 +1486,7 @@ end
 **展开（2 分钟版）**：
 1. `redis-cli --latency` 和 `redis-cli --latency-history` 先确认延迟是否真的高。
 2. `SLOWLOG GET 20`：`slowlog-log-slower-than` 默认 10000 微秒，看是否有 `HGETALL`、`KEYS`、`SMEMBERS`、`ZRANGE` 全量拉取。
-3. `INFO commandstats | sort -t= -k3 -rn | head`：按 `usec_per_call` 找最耗 CPU 的命令。
+3. `INFO commandstats | sort -t= -k3 -rn | head`：`-k3` 排的是 `usec`（总耗时），想按单次平均耗时排就改成 `-k4`（`usec_per_call`）。
 4. `redis-cli --bigkeys` + `MEMORY USAGE key`：找大 key，`UNLINK` 异步删除替代 `DEL`。
 5. `INFO stats | grep latest_fork_usec`：`fork` 耗时超过 1 秒说明实例内存太大。
 6. `INFO memory | grep mem_fragmentation_ratio`：大于 1.5 考虑内存碎片或 swap。
@@ -1512,7 +1529,7 @@ end
 2. 多 key 命令：`MGET`、`MSET`、`SUNION`、`ZINTERSTORE`、`BITOP`、多 key `PFCOUNT` 等，跨槽报 `CROSSSLOT Keys in request don't hash to the same slot`。
 3. **hash tag 解法**：`{user:1001}:name` 与 `{user:1001}:order` 都哈希 `user:1001`，必落同槽。代价是单用户数据在单节点，热用户会倾斜。
 4. **客户端聚合解法**：`MGET` 改成按槽分组后并行发多个 `MGET`，在应用层合并结果。前提是每个分组内的 key 同槽。
-5. **Lua 与事务**：Redis 7.0 起明确强制校验脚本中所有 key 必须同槽；`MULTI` 中的跨槽命令 `EXEC` 直接报错。
+5. **Lua 与事务**：Cluster 模式下强制校验脚本中所有 key 必须同槽（跨槽直接报错，且必须通过 `KEYS` 数组传参）；`MULTI` 中的跨槽命令 `EXEC` 直接报错。
 6. **`KEYS` / `SCAN`**：只扫本节点。要全集群扫描用 `redis-cli --cluster call <node> KEYS <pattern>`，或按 key 前缀路由到已知节点。
 
 **追问**：`cluster-require-full-coverage` 默认 yes 有什么影响？答：只要有任何一个槽不可用，整个集群返回 `CLUSTERDOWN` 停止服务。高可用优先的场景可以设为 `no`，让部分槽降级，其余继续服务。
@@ -1534,7 +1551,7 @@ end
 
 | 易错点 | 正确理解 |
 | --- | --- |
-| "`repl_backlog_size` 默认 1MB 够用" | 1MB 只够主库 0.2 秒的写入，生产必须按 2.3 的公式调到 64MB 以上 |
+| "`repl_backlog_size` 默认 1MB 够用" | 1MB 只够主库 5MB/s 写入量 0.2 秒的份额，生产必须按 2.3 的公式（写入速率 × 最长断连时间）调到 64MB 以上 |
 | "`repl_backlog_buffer` 每个从库一份" | 主库全局共享一份；每个从库独立的是 replication buffer（`client-output-buffer-limit replica`） |
 | "哨兵 quorum 就是多数派" | quorum 只需达到配置值即可判 ODOWN；选举 Leader 才需要 majority = `(哨兵总数/2)+1` |
 | "2 个哨兵也能高可用" | 挂 1 个就达不到 majority，无法选举，至少 3 个且奇数 |
@@ -1561,12 +1578,12 @@ end
 | "Redis 事务出错会回滚" | 运行期错误**不回滚**，其余命令继续执行；只有入队期的语法错误才整组不执行 |
 | "`WATCH` 后 `EXEC` 一定成功" | 被监视的 key 被改过则返回 `nil`，业务必须重试 |
 | "Lua 脚本可以随便杀" | `SCRIPT KILL` 只能杀未执行过写命令的脚本；已写的只能 `SHUTDOWN NOSAVE` |
-| "Lua 里可以用任意 key" | Cluster 下所有 key 必须同槽，Redis 7.0 起强制校验，且必须通过 `KEYS` 数组传递 |
+| "Lua 里可以用任意 key" | Cluster 下所有 key 必须同槽且强制校验，且必须通过 `KEYS` 数组传递 |
 | "`RedisTemplate` 直接传 Long 给 Lua 就行" | 默认 `JdkSerializationRedisSerializer` 会序列化成带类型头的字节，Lua 里 `tonumber` 失败；必须用 `StringRedisTemplate` |
 | "`MIGRATE` 是异步的" | **同步阻塞**，迁大 key 会卡住源节点，是 Cluster 事故高发点 |
 | "删除大 key 用 `DEL` 就好" | `DEL` 是同步释放内存会阻塞，应该用 `UNLINK` 异步回收 |
 | "`slowlog-log-slower-than` 默认 1 毫秒" | 默认 **10000 微秒（10 毫秒）**，`slowlog-max-len` 默认 128 |
-| "Redis 7.0 的命令执行是多线程的" | 7.0 只多线程化了网络 IO（`io-threads`），**命令执行仍是单线程** |
+| "Redis 的命令执行是多线程的" | 只有 6.0 起的 `io-threads` 把网络 IO 多线程化了，**命令执行仍是单线程** |
 
 ## 一句话速记
 

@@ -127,7 +127,7 @@ classDiagram
   class BaseExecutor {
     #PerpetualCache localCache
     #int queryStack
-    #List deferredLoads
+    #ConcurrentLinkedQueue deferredLoads
     +createCacheKey(ms, param, rb, boundSql)
     +clearLocalCache()
   }
@@ -225,8 +225,8 @@ public Executor newExecutor(Transaction transaction, ExecutorType executorType) 
 protected PerpetualCache localCache;          // 一级缓存，本质 HashMap
 protected PerpetualCache localOutputParameterCache;
 protected int queryStack;                     // 查询嵌套深度
-private final List<DeferredLoad> deferredLoads; // 延迟加载队列
-protected boolean closed;
+protected ConcurrentLinkedQueue<DeferredLoad> deferredLoads; // 延迟加载队列
+private boolean closed;
 ```
 
 ### 2.2 StatementHandler：SQL 到 Statement
@@ -241,7 +241,7 @@ protected boolean closed;
 
 `BaseStatementHandler` 持有关键字段：`configuration`、`executor`、`mappedStatement`、`parameterObject`、`rowBounds`、`boundSql`、`parameterHandler`、`resultSetHandler`、`typeHandlerRegistry`。构造时通过 `configuration.newParameterHandler(...)` 和 `configuration.newResultSetHandler(...)` 创建后两者——**这正是插件能分别代理到它们的原因**。
 
-`PreparedStatementHandler#query` 的核心只有四行：`ps.execute()`、`resultSetHandler.handleResultSets(ps)`、`closeStatement`、返回 list。所有魔法都在 `ResultSetHandler` 里。
+`PreparedStatementHandler#query` 的核心只有两行：`ps.execute()` 和 `resultSetHandler.handleResultSets(ps)`；关语句不在这里，而在 `SimpleExecutor#doQuery` 的 `finally` 里（`ReuseExecutor` 则故意不关，留给 `statementMap` 复用）。所有魔法都在 `ResultSetHandler` 里。
 
 ### 2.3 ParameterHandler：把 `?` 填上
 
@@ -281,7 +281,7 @@ for (int i = 0; i < parameterMappings.size(); i++) {
 
 ### 2.4 ResultSetHandler：结果映射主战场
 
-`DefaultResultSetHandler` 字段最多，也是 MyBatis 最复杂的一个类：`executor`、`configuration`、`mappedStatement`、`rowBounds`、`typeHandlerRegistry`、`objectFactory`、`objectWrapperFactory`、`reflectorFactory`、`resultMaps`、`mappedStatements`、`typeHandlerMap`、`nestedResultMaps`、`pendingRelations`、`unmappedColumnNames`。
+`DefaultResultSetHandler` 字段最多，也是 MyBatis 最复杂的一个类：`executor`、`configuration`、`mappedStatement`、`rowBounds`、`parameterHandler`、`resultHandler`、`boundSql`、`typeHandlerRegistry`、`objectFactory`、`reflectorFactory`、`nestedResultObjects`、`ancestorObjects`、`nextResultMaps`、`pendingRelations`、`autoMappingsCache`、`constructorAutoMappingColumns`。
 
 入口方法 `handleResultSets(Statement stmt)` 的流程固定：
 
@@ -289,9 +289,9 @@ for (int i = 0; i < parameterMappings.size(); i++) {
 2. 每个结果集依次匹配 `MappedStatement#getResultMaps()`，多结果集靠 `@ResultMap`/`<resultMap>` 顺序对齐。
 3. 调 `handleResultSet` → `handleRowValues` → `getRowValue`。
 4. `getRowValue` 里先 `createResultObject` 造对象，再 `applyPropertyMappings`（显式映射）和 `applyAutomaticMappings`（自动映射）。
-5. 收尾 `collapseSingleResultList`：结果只有一行且方法返回单对象时，`List` 会被压成单对象，此时如果 `resultOrdered` 或嵌套映射需要 `List`，就会踩坑。
+5. 收尾 `collapseSingleResultList`：只处理了 1 个 `ResultSet` 时，把"结果集列表"拆开、直接返回该结果集自己的 `List`（多个结果集时才返回嵌套 `List`）。判断依据是结果集个数，不是行数。
 
-**为什么这么设计？** 把"SQL 文本生成"（`SqlSource`）和"结果装配"（`ResultSetHandler`）彻底分开，是为了让同一份 `ResultMetaObject` 既能服务静态 SQL，也能服务存储过程和多结果集。代价是 `DefaultResultSetHandler` 这个类超过 1400 行，嵌套映射的状态机（`pendingRelations`、`nestedResultMap`、`rowKey`）极难调试——这也是"复杂 join 映射不如拆成两次查询"的根因。
+**为什么这么设计？** 把"SQL 文本生成"（`SqlSource`）和"结果装配"（`ResultSetHandler`）彻底分开，是为了让同一份结果映射元数据（`ResultMap`）既能服务静态 SQL，也能服务存储过程和多结果集。代价是 `DefaultResultSetHandler` 这个类超过 1400 行，嵌套映射的状态机（`pendingRelations`、`nestedResultMap`、`rowKey`）极难调试——这也是"复杂 join 映射不如拆成两次查询"的根因。
 
 ## 三、SqlSessionFactory 构建与 Configuration
 
@@ -317,7 +317,7 @@ SqlSessionFactory factory = new SqlSessionFactoryBuilder().build(inputStream);
 | `mapperRegistry` | `MapperRegistry` | Mapper 接口 → `MapperProxyFactory` |
 | `languageRegistry` | `LanguageDriverRegistry` | 默认 `XMLLanguageDriver` |
 
-`StrictMap` 是防呆设计：`put` 时若 key 冲突直接抛 `IllegalArgumentException`；取短名（不带 namespace）时若存在多个同短名，抛 `"The short name is ambiguous, which should be different from ..."`。这就是"两个 mapper 有同名 `selectById` 但 namespace 不同"为什么会报错的原因。
+`StrictMap` 是防呆设计：`put` 时若 key 冲突直接抛 `IllegalArgumentException`；取短名（不带 namespace）时若存在多个同短名，`get` 会拿到内部的 `Ambiguity` 占位对象并抛 `IllegalArgumentException("<短名> is ambiguous in Mapped Statements collection (try using the full name including the namespace, or rename one of the entries)")`。这就是"两个 mapper 有同名 `selectById` 但 namespace 不同"为什么会报错的原因。
 
 ### 3.2 parseConfiguration 的顺序约束（启动报错第一名）
 
@@ -340,7 +340,7 @@ typeHandlerElement(root.evalNode("typeHandlers"));
 mapperElement(root.evalNode("mappers"));
 ```
 
-DTD 规定的合法顺序是 `properties → settings → typeAliases → plugins → objectFactory → objectWrapperFactory → reflectorFactory → environments → databaseIdProvider → typeHandlers → mappers`。把 `<plugins>` 写在 `<mappers>` 后面，启动会直接抛 `The content of element type "configuration" must match ...`。同时注意 `settingsElement` 虽然在 `pluginElement` 之后调用，但 settings 的属性值在更早的 `settingsAsProperties` 就解析完了，所以插件拿到的 `Configuration` 已经是完整配置。
+DTD（`mybatis-3-config.dtd`）规定的合法顺序是 `properties → settings → typeAliases → typeHandlers → objectFactory → objectWrapperFactory → reflectorFactory → plugins → environments → databaseIdProvider → mappers`：`typeHandlers` 排在 `objectFactory` 之前、`plugins` 排在 `reflectorFactory` 之后，和上面代码里的调用顺序并不一致（代码把 `typeHandlers` 放到了最后）。把 `<plugins>` 写在 `<mappers>` 后面，启动会直接抛 `The content of element type "configuration" must match ...`。另外，`settingsAsProperties` 只负责把 `<setting>` 读成 `Properties` 并校验 key 名是否合法，真正写进 `Configuration` 是后面的 `settingsElement`；插件在 `pluginElement` 阶段只会被调一次 `setProperties(Properties)`，运行时在 `intercept` 里拿到的 `Configuration` 才是完整配置。
 
 ### 3.3 settings 默认值
 
@@ -361,9 +361,9 @@ DTD 规定的合法顺序是 `properties → settings → typeAliases → plugin
 | `useActualParamName` | `true` | 需编译期 `-parameters`，否则退化为 `arg0/arg1` |
 | `callSettersOnNulls` | `false` | Map 结果不会包含 null 列 |
 | `returnInstanceForEmptyRow` | `false` | false 时空行返回 null 而不是空对象 |
-| `autoMappingBehavior` | `PARTIAL` | 只对没有嵌套 resultMap 的结果集自动映射 |
+| `autoMappingBehavior` | `PARTIAL` | 顶层结果映射自动映射；嵌套结果映射内部不自动映射（`FULL` 才映射） |
 | `autoMappingUnknownColumnBehavior` | `NONE` | 可选 `WARNING`、`FAILING`，排查列名写错很有用 |
-| `safeResultHandlerEnabled` | `true` | 使用自定义 `ResultHandler` 时禁止嵌套映射的某些优化 |
+| `safeResultHandlerEnabled` | `true` | 语句含嵌套结果映射时，用自定义 `ResultHandler` 会抛 `ExecutorException`（除非该语句设了 `resultOrdered=true`）；设 false 可绕过该检查 |
 | `multipleResultSetsEnabled` | `true` | 允许存储过程返回多个结果集 |
 | `logImpl` | 未指定 | 按 `SLF4J → COMMONS_LOGGING → LOG4J2 → LOG4J → JDK_LOGGING → NO_LOGGING` 自动探测 |
 | `shrinkWhitespacesInSql` | `false` | 3.5.5+，压缩 SQL 空白，减少解析缓存 key 膨胀 |
@@ -461,7 +461,7 @@ flowchart TD
   E -->|"FLUSH"| H["sqlSession.flushStatements"]
 ```
 
-`SqlCommand` 决定 `MappedStatement` 的查找 key，方法是 `MapperMethod.SqlCommand#resolveMappedStatement`：先拼 `declaringClass.getName() + "." + method.getName()`，找不到再用 `mapperInterface.getName() + "." + name` 兜底，都没有就抛：
+`SqlCommand` 决定 `MappedStatement` 的查找 key，方法是 `MapperMethod.SqlCommand#resolveMappedStatement`：先拼 `mapperInterface.getName() + "." + method.getName()`，找不到再递归父接口（`declaringClass` 继承的那些接口），都没有就抛：
 
 ```
 org.apache.ibatis.binding.BindingException: Invalid bound statement (not found): com.x.UserMapper.selectById
@@ -476,7 +476,7 @@ org.apache.ibatis.binding.BindingException: Invalid bound statement (not found):
 | 情况 | 可用的 `#{}` 名称 |
 | --- | --- |
 | 单个参数且无 `@Param`，且不是集合/数组 | 直接写属性名，如 `#{name}`、`#{id}` |
-| 单个参数是 `Collection`/`List`/数组 | `collection`/`list`/`array`，以及 `param1` |
+| 单个参数是 `Collection`/`List`/数组 | `collection`/`list`/`array`（**没有** `param1`，报错信息就是 `Available parameters are [collection, list]`） |
 | 多个参数，有 `@Param` | `@Param` 指定的名字 + `param1..paramN` |
 | 多个参数，无 `@Param` | `arg0..argN-1` + `param1..paramN`；若编译加 `-parameters` 则用真实参数名 |
 | 3.5.x 传了 `ParamMap` 或 `Map` | 直接按 Map 的 key 取 |
@@ -659,7 +659,7 @@ MyBatis-Plus 的 `QueryWrapper#orderByAsc(String...)` 传字符串时同样是 S
 | `User query(User u)` | `#{userName}`（直接属性名） |
 | 多参数 | `#{param1}`、`#{arg0}`，或加 `@Param("id")` |
 
-`DefaultSqlSession#wrapCollection(Object)` 只在**参数个数为 1** 时生效：把集合包成 `StrictMap`，key 为 `collection`（`Collection`）、`list`（`List`）、`array`（数组），并额外放 `param1`。这就是"单个 List 参数用 `#{item}` 取不到值"的原因。
+`DefaultSqlSession#wrapCollection(Object)` 只在**参数个数为 1** 时生效：把集合包成 `ParamMap`，key 为 `collection`（`Collection`）、`list`（`List`）、`array`（数组），**没有** `param1`。这就是"单个 List 参数用 `#{item}` 取不到值"的原因。
 
 ## 七、动态 SQL 与 SqlNode 树
 
@@ -760,9 +760,9 @@ flowchart TD
 
 自动映射发生在 `DefaultResultSetHandler#applyAutomaticMappings`，判定顺序：
 
-1. `ResultMap#isAutoMapping()` 为 false 时，若 `autoMappingBehavior` 为 `NONE` → 跳过。
-2. `autoMappingBehavior=PARTIAL`（默认）→ 只在**没有嵌套 resultMap**（即没有 `select` 属性的 association/collection）时才自动映射。
-3. `autoMappingBehavior=FULL` → 无论是否嵌套都自动映射（`resultMap` 元素仍优先）。
+1. `ResultMap#getAutoMapping()`（对应 `<resultMap autoMapping="...">`）不为 null 时以它为准，为 false 直接跳过，覆盖全局 `autoMappingBehavior`。
+2. `autoMappingBehavior=NONE` → 全部不自动映射；`PARTIAL`（默认）→ **顶层**结果映射照常自动映射，但嵌套结果映射（`<association>`/`<collection>` 内联 `<result>`）内部不自动映射。
+3. `autoMappingBehavior=FULL` → 嵌套结果映射内部也自动映射（`resultMap` 元素仍优先）。
 4. 已出现在 `ResultMap#getMappedColumns()` 的列不再自动映射，避免覆盖显式配置。
 5. 未匹配的列按 `autoMappingUnknownColumnBehavior` 处理：`NONE` 静默忽略、`WARNING` 打日志、`FAILING` 抛 `IllegalArgumentException`。
 
@@ -770,7 +770,7 @@ flowchart TD
 
 - `mapUnderscoreToCamelCase=true` 时走 `configuration.isMapUnderscoreToCamelCase()` → `String#toUpperCase` 比较方式，`user_name` → `userName`。
 - `useColumnLabel=true`（默认）用 `ResultSetMetaData#getColumnLabel`，所以 `select user_name as userName` 生效；设为 false 用 `getColumnName`，别名会失效。
-- 属性有 `@Param` 无关，这里用的是 `MetaClass#findProperty(String name, boolean useCamelCaseMapping)`。
+- 这一步与 `@Param` 无关，用的是 `MetaClass#findProperty(String name, boolean useCamelCaseMapping)`。
 
 ```mermaid
 flowchart TD
@@ -779,7 +779,7 @@ flowchart TD
   C -->|"是"| D["applyPropertyMappings 用显式 TypeHandler"]
   C -->|"否"| E{"autoMappingBehavior 允许?"}
   E -->|"NONE"| F["未映射列被忽略"]
-  E -->|"PARTIAL 且存在嵌套 select"| F
+  E -->|"PARTIAL 且在嵌套结果映射内"| F
   E -->|"允许"| G{"属性名能匹配列名?"}
   G -->|"直接匹配"| H["applyAutomaticMappings 赋值"]
   G -->|"下划线转驼峰开启"| H
@@ -803,7 +803,7 @@ N+1 的三种解法：
 2. 改成嵌套结果 + `resultOrdered="true"`，让同一父记录的子行连续，`DefaultResultSetHandler` 可以尽早释放上一组，降低内存。
 3. 两段式查询：先查主表拿到 id 集合，再用一次 `IN` 查子表，在 Service 层组装。这是大列表接口的推荐做法。
 
-**为什么默认 `lazyLoadingEnabled=false`？** 因为延迟加载需要 `javassist` 或 `cglib` 生成子类代理，`Configuration#lazyLoadingEnabled` 为 true 但没有代理工厂时会直接抛 `BuilderException("The 'lazyLoadingEnabled' setting is not compatible with ...")`。MyBatis 把默认值设成 false 是"默认不引入额外依赖"的保守选择。
+**为什么默认 `lazyLoadingEnabled=false`？** 不是因为缺依赖：MyBatis 自带 Javassist（包内就是 `org.apache.ibatis.javassist`），`Configuration#proxyFactory` 默认就是 `JavassistProxyFactory`，`Configuration#setLazyLoadingEnabled` 本身也不做任何校验。默认关闭是"要显式打开"的保守选择——延迟加载会生成代理对象，一旦被 `lazyLoadTriggerMethods` 或 JSON 序列化触发，就是额外的 N+1 查询。
 
 ## 九、一级缓存
 
@@ -858,7 +858,7 @@ public CacheKey createCacheKey(MappedStatement ms, Object parameterObject, RowBo
 | --- | --- | --- |
 | 执行任意 insert/update/delete | `BaseExecutor#update` 首行 `clearLocalCache()` | 整个 SqlSession 缓存清空 |
 | `commit` / `rollback` | `BaseExecutor#commit(boolean)`、`rollback(boolean)` 先 `clearLocalCache()` | 清空 |
-| `close()` | `BaseExecutor#close` → `localCache.clear()` | 清空并标记 closed |
+| `close()` | `BaseExecutor#close` 先调 `rollback`（内部 `clearLocalCache()`），再把 `localCache` 置 `null` | 清空并标记 closed |
 | `sqlSession.clearCache()` | `BaseExecutor#clearLocalCache` | 手动清空 |
 | `localCacheScope=STATEMENT` | `BaseExecutor#query` 中 `queryStack == 0` 时 `clearLocalCache()` | 每次查询结束即清空 |
 | SQL 上 `flushCache="true"` | `BaseExecutor#query` 中 `if (queryStack == 0 && ms.isFlushCacheRequired()) clearLocalCache()` | 该查询前清空 |
@@ -930,12 +930,13 @@ flowchart TD
 `CacheBuilder#build` 按顺序包装：
 
 ```
-ScheduledCache(flushInterval 非空)
-  -> LoggingCache
-    -> SynchronizedCache 或 BlockingCache
-      -> SerializedCache(readOnly=false)
-        -> LruCache / FifoCache / SoftCache / WeakCache
-          -> PerpetualCache (delegate)
+BlockingCache（blocking=true 才有，最外层）
+  -> SynchronizedCache
+    -> LoggingCache
+      -> SerializedCache（readWrite 才有，即 readOnly=false）
+        -> ScheduledCache（flushInterval 非空才有）
+          -> LruCache / FifoCache / SoftCache / WeakCache
+            -> PerpetualCache (delegate)
 ```
 
 `LoggingCache` 负责打印 `Cache Hit Ratio`，日志级别为 DEBUG，类名 `org.apache.ibatis.cache.decorators.LoggingCache`。
@@ -1019,7 +1020,7 @@ flowchart TD
 
 **正确定位**：MyBatis 二级缓存适合"单表、读多写极少、能接受秒级不一致、单机或可接受多副本不一致"的场景（如字典表、配置表）。互联网业务更常见的做法是**关掉二级缓存，把缓存放到 Service 层用 Redis 显式管理**，因为那里才能控制 key 设计、过期策略、更新顺序和分布式失效。
 
-如果确实要用，必须同时做到：实体 `Serializable`；`flushInterval` 设一个较小值（如 60000ms）兜底；用 `<cache-ref>` 或 `@CacheNamespaceRef` 让共享表的 namespace 共用一个 cache；换成 `RedisCache` 并配 `TransactionAwareCacheDecorator` 保证事务提交后才写缓存。
+如果确实要用，必须同时做到：实体 `Serializable`；`flushInterval` 设一个较小值（如 60000ms）兜底；用 `<cache-ref>` 或 `@CacheNamespaceRef` 让共享表的 namespace 共用一个 cache；换成 `RedisCache`，并自己在 `Cache` 实现里保证"事务提交后才写缓存"（Spring 的 `TransactionAwareCacheDecorator` 包装的是 Spring 自己的 `org.springframework.cache.Cache`，与 MyBatis 的 `Cache` 不是一套接口，套不上）。
 
 ## 十一、插件机制与四大对象的代理链
 
@@ -1114,7 +1115,7 @@ flowchart TD
 | `Configuration#newParameterHandler` | 创建 `DefaultParameterHandler` 后 | `DefaultParameterHandler` |
 | `Configuration#newResultSetHandler` | 创建 `DefaultResultSetHandler` 后 | `DefaultResultSetHandler` |
 
-`newExecutor` 的顺序有一个必须记住的细节：`CachingExecutor` 先包装 `BaseExecutor`，然后才 `pluginAll`。所以拦截 `Executor` 的插件看到的是 `CachingExecutor`，**拦截点在二级缓存之外**——PageHelper 正是利用这一点：它在 count 查询和分页查询时都直接操作 `Executor`，绕过一级/二级缓存需要自己处理。
+`newExecutor` 的顺序有一个必须记住的细节：`CachingExecutor` 先包装 `BaseExecutor`，然后才 `pluginAll`。所以拦截 `Executor` 的插件看到的是 `CachingExecutor`，**拦截点在二级缓存之外**——PageHelper 正是利用这一点：count 查询和分页查询都由它改写 SQL 后重新调 `Executor#query`（`CacheKey` 随之变化），所以命中缓存与否要自己评估。
 
 ### 11.5 用插件改 SQL 的正确姿势
 
@@ -1195,7 +1196,7 @@ sequenceDiagram
 | 返回类型 | `com.github.pagehelper.Page<E>` | `extends ArrayList<E>`，额外持有 `pageNum`、`pageSize`、`total`、`pages` |
 | 统计封装 | `com.github.pagehelper.PageInfo<T>` | 由 `Page` 计算 `total`、`pages`、`isFirstPage`、`hasNextPage` |
 
-`Page` 继承 `ArrayList` 是 PageHelper 5.x 的设计（6.x 有调整）。好处是"分页结果可以直接当 `List` 用"；代价是 `Page` 对象本身就是结果集，一旦被业务当作普通 List 缓存下来，`pageNum/total` 等分页元信息会一起被缓存。
+`Page` 继承 `ArrayList` 是 PageHelper 5.x 的设计（6.x 仍是 `extends ArrayList`，只是额外实现了 `Closeable`）。好处是"分页结果可以直接当 `List` 用"；代价是 `Page` 对象本身就是结果集，一旦被业务当作普通 List 缓存下来，`pageNum/total` 等分页元信息会一起被缓存。
 
 ### 12.3 配置项与默认值
 
@@ -1317,7 +1318,7 @@ flowchart TD
 `mybatis-spring-boot-starter` 的 `MybatisAutoConfiguration` 条件：
 
 - `@ConditionalOnClass({SqlSessionFactory.class, SqlSessionFactoryBean.class})`
-- `@ConditionalOnSingleCandidate(DataSource.class)`——**多数据源时自动配置失效**，必须手动配 `SqlSessionFactoryBean`。
+- `@ConditionalOnSingleCandidate(DataSource.class)`——**多数据源时自动配置失效**，必须手动配 `SqlSessionFactoryBean`，并用 `@MapperScan(basePackages = "...", sqlSessionFactoryRef = "xxx", sqlSessionTemplateRef = "yyy")`（或 `MapperScannerConfigurer#setSqlSessionFactoryBeanName` / `setSqlSessionTemplateBeanName`）指定每个 Mapper 包挂在哪个工厂上，否则 Mapper 会绑到错误的 `SqlSessionFactory`。
 - `@AutoConfigureAfter({DataSourceAutoConfiguration.class, MybatisLanguageDriverAutoConfiguration.class})`
 
 两个容易踩的点：
@@ -1360,7 +1361,7 @@ flowchart TD
 | `Object` | `ObjectTypeHandler`/`UnknownTypeHandler` | 兜底 |
 | 枚举 | `EnumTypeHandler` | 存 `name()` |
 
-`LocalDateTimeTypeHandler` 用 `ps.setObject` 而不是 `Timestamp.valueOf`，是 3.5.x 的行为。旧驱动（如 MySQL Connector/J 5.1.37 以下）对 `setObject(LocalDateTime)` 支持不完整，会抛 `SQLFeatureNotSupportedException`，需要降级写法或升级驱动。
+`LocalDateTimeTypeHandler` 从 3.4.5 引入起就用 `ps.setObject` 而不是 `Timestamp.valueOf`。旧驱动（如 MySQL Connector/J 5.1.37 以下）对 `setObject(LocalDateTime)` 支持不完整，会抛 `SQLFeatureNotSupportedException`，需要降级写法或升级驱动。
 
 ### 14.3 枚举映射的三种方案
 
@@ -1406,7 +1407,7 @@ public class OrderStatusTypeHandler extends BaseTypeHandler<OrderStatus> {
 
 `BaseTypeHandler` 的四个抽象方法必须全实现：一个写、三个读（按列名、按列下标、从 `CallableStatement` 按下标）。继承 `BaseTypeHandler` 而不是直接实现 `TypeHandler`，是因为基类帮你处理了 null 分支（`setParameter` 里 null 走 `ps.setNull`，`getResult` 里 null 返回 null）。
 
-**MyBatis-Plus 的枚举方案**：实现 `com.baomidou.mybatisplus.annotation.IEnum<T>` 并配置 `mybatis-plus.configuration.default-enum-type-handler: com.baomidou.mybatisplus.core.handlers.MybatisEnumTypeHandler`，MP 会自动处理实现了 `IEnum` 的枚举。注意该 handler 只对实现 `IEnum` 的枚举生效，普通枚举仍走 `EnumTypeHandler`。
+**MyBatis-Plus 的枚举方案**：只实现 `com.baomidou.mybatisplus.annotation.IEnum<T>` 即可——MP 的 `MybatisConfiguration` 在初始化时就把 `defaultEnumTypeHandler` 设成了 `CompositeEnumTypeHandler`，由它按枚举是否为 MP 枚举（实现 `IEnum` 或标注 `@EnumValue`）分派给 `MybatisEnumTypeHandler`，普通枚举仍回落到 `EnumTypeHandler`，不需要手工配置。
 
 ## 十五、批处理与性能优化
 
@@ -1437,7 +1438,7 @@ jdbc:mysql://host:3306/db?rewriteBatchedStatements=true&useServerPrepStmts=false
 
 | 数据库 | 流式查询条件 |
 | --- | --- |
-| MySQL | 连接串 `useCursorFetch=true` 且 `statement.setFetchSize(Integer.MIN_VALUE)`；MyBatis 里通过 `defaultFetchSize` 设不了 `Integer.MIN_VALUE` 的语义，需自定义 `ResultSetType.FORWARD_ONLY` + 自定义参数 |
+| MySQL | 两条独立路径：连接串 `useCursorFetch=true` 且 `setFetchSize(正整数)` 走服务端游标；或 `setFetchSize(Integer.MIN_VALUE)` 走逐行流式读取（不依赖 `useCursorFetch`）。MyBatis 侧把 `defaultFetchSize` 配成 `-2147483648` 即可，它会被原样透传给 `Statement#setFetchSize` |
 | PostgreSQL | 必须 `autoCommit=false`（即必须在事务里）才启用游标；否则驱动会把整个结果集读进内存，`fetchSize` 被忽略 |
 | Oracle | `defaultRowPrefetch` 默认 10，可调 |
 
@@ -1475,7 +1476,7 @@ MyBatis 侧的 `Cursor<T>` 是流式返回的入口：Mapper 方法返回 `Curso
 
 ### 16.1 版本与核心类
 
-MyBatis-Plus 3.5.x（JDK 8+），坐标 `com.baomidou:mybatis-plus-boot-starter`（Boot 3 用 `mybatis-plus-spring-boot3-starter`）。
+MyBatis-Plus 3.5.x（JDK 8+），坐标 `com.baomidou:mybatis-plus-boot-starter`（Boot 3 用 `mybatis-plus-spring-boot3-starter`）。注意 3.5.x 后期把依赖 jsqlparser 的插件（`PaginationInnerInterceptor`、`TenantLineInnerInterceptor`、`BlockAttackInnerInterceptor` 等）从 `mybatis-plus-extension` 拆到了 `mybatis-plus-jsqlparser` 模块，并在主 pom 里标成 `optional`：用分页/多租户时必须在自己的 pom 里显式引一次（按 jsqlparser 大版本选 `mybatis-plus-jsqlparser` 或 `mybatis-plus-jsqlparser-4.9`），否则启动或首次分页就报 `NoClassDefFoundError`。
 
 | 能力 | 类/注解 | 说明 |
 | --- | --- | --- |
@@ -1524,7 +1525,7 @@ MyBatis-Plus 3.5.x（JDK 8+），坐标 `com.baomidou:mybatis-plus-boot-starter`
 | `sequenceBits` | 12（每毫秒 4096 个） |
 | 时间戳位数 | 41 位 |
 
-实现类默认从网卡/主机名推导 `workerId` 和 `datacenterId`。**多实例部署时若容器主机名相同，可能生成重复 ID**，生产必须显式指定 `IdentifierGenerator` 或配置 `mybatis-plus.global-config.worker-id` / `datacenter-id`（3.4.x 起支持在 `GlobalConfig` 上设置）。
+实现类默认从网卡/主机名推导 `workerId` 和 `datacenterId`。**多实例部署时若容器主机名相同，可能生成重复 ID**，生产必须显式指定 `IdentifierGenerator`，或配置 `mybatis-plus.global-config.sequence.worker-id` / `sequence.datacenter-id`（对应 `GlobalConfig.Sequence`）。另一半风险是**时钟回拨**：`Sequence#nextId` 检测到当前时间小于上次发号时间会直接抛 `RuntimeException("Clock moved backwards. Refusing to generate id for %d milliseconds")`，NTP 校时或容器迁移后会出现发号失败，需要业务侧兜底。
 
 ### 16.4 MyBatis-Plus 的坑
 
@@ -1639,7 +1640,7 @@ flowchart TD
 1. `Configuration#newExecutor` 决定 Executor 类型，默认 `SIMPLE`，`cacheEnabled=true` 时外面套 `CachingExecutor`，最后 `pluginAll`。
 2. `BaseExecutor` 模板方法固化"查一级缓存 → 查库 → 回填缓存"，三个子类只实现 `doQuery`/`doUpdate`。
 3. `BaseStatementHandler` 在构造时创建 `ParameterHandler` 和 `ResultSetHandler`，并持有 `BoundSql`。
-4. `PreparedStatementHandler#query` 只有四步：`ps.execute()`、`resultSetHandler.handleResultSets(ps)`、关语句、返回。
+4. `PreparedStatementHandler#query` 只有两步：`ps.execute()`、`resultSetHandler.handleResultSets(ps)`；关语句由 `SimpleExecutor#doQuery` 的 `finally` 负责。
 
 **追问**：为什么 `RoutingStatementHandler` 不直接在 `Configuration` 里 if-else 选？答：因为它同时是插件拦截目标，做成一个"总是存在的门面"可以让插件只写一个签名就能拦到三种 Statement。
 
@@ -1651,7 +1652,7 @@ flowchart TD
 
 1. `MapperProxy#invoke` 三个分支：`Object` 方法 `method.invoke(this, args)`；`default` 方法走 `DefaultMethodInvoker`（JDK 8 用 `MethodHandles.Lookup` 私有构造，JDK 9+ 用 `privateLookupIn`）；其余走 `PlainMethodInvoker`。
 2. `MapperMethod` 拆成 `SqlCommand`（statementId + `SqlCommandType`）和 `MethodSignature`（`returnsMany/returnsMap/returnsCursor/returnsOptional/returnsVoid`）。
-3. statementId 先按"声明类全限定名 + 方法名"找，找不到再用"接口全限定名 + 方法名"，都找不到抛 `BindingException: Invalid bound statement (not found)`。
+3. statementId 先按"接口全限定名 + 方法名"找，找不到再递归父接口（`declaringClass` 继承的那些接口），都找不到抛 `BindingException: Invalid bound statement (not found)`。
 
 **追问**：Mapper 能 `equals` 比较吗？答：`equals` 走 `Object` 分支，即 `this.equals` 的默认引用比较，两个不同 SqlSession 生成的代理不相等，不要用它做去重或 Map key。
 
@@ -1798,7 +1799,7 @@ flowchart TD
 
 1. 全局默认可用 3.4.5+ 的 `defaultEnumTypeHandler` 配置改。
 2. 自定义 handler 要继承 `BaseTypeHandler<T>` 并实现四个方法（写一个、读三个），标注 `@MappedTypes`、`@MappedJdbcTypes`，通过 `type-handlers-package` 或 `<typeHandlers>` 注册。
-3. MyBatis-Plus 场景实现 `IEnum<T>` 并配 `default-enum-type-handler: com.baomidou.mybatisplus.core.handlers.MybatisEnumTypeHandler`，注意它只对实现了 `IEnum` 的枚举生效。
+3. MyBatis-Plus 场景只需实现 `IEnum<T>`：MP 默认把 `defaultEnumTypeHandler` 设为 `CompositeEnumTypeHandler`，只对实现 `IEnum`（或带 `@EnumValue`）的枚举分派给 `MybatisEnumTypeHandler`，普通枚举仍走 `EnumTypeHandler`。
 4. 查询条件里的枚举也要走到 handler：`#{status}` 的 `TypeHandler` 由参数类型决定，若参数是 `String` 而列是 `int`，`EnumTypeHandler` 不会介入。
 
 **追问**：`EnumTypeHandler` 存 name 有什么风险？答：枚举常量改名（重构时 IDE 会连带改）会导致历史数据失配，读出来抛 `IllegalArgumentException: No enum constant`。所以枚举名一旦上线就不能改。
@@ -1847,7 +1848,7 @@ flowchart TD
 | "开了 `ExecutorType.BATCH` 插入就快了" | 还需驱动层 `rewriteBatchedStatements=true`，且同批必须是同一条 SQL 才会复用 Statement |
 | "批量插入的返回值是影响行数" | `BatchExecutor#doUpdate` 返回 `Integer.MIN_VALUE + 1002` |
 | "`EnumOrdinalTypeHandler` 更省空间，可以用" | 枚举顺序变化导致历史数据全错，生产禁用 |
-| "`defaultEnumTypeHandler` 改了，MP 的 `IEnum` 也会跟着变" | MP 的 `MybatisEnumTypeHandler` 需单独配置，且只对实现 `IEnum` 的枚举生效 |
+| "MP 的枚举要手工配 `MybatisEnumTypeHandler`" | MP 默认已通过 `CompositeEnumTypeHandler` 自动分派，不需要手工配；只有实现 `IEnum`/带 `@EnumValue` 的枚举走 `MybatisEnumTypeHandler`，普通枚举仍走 `EnumTypeHandler` |
 | "`jdbcTypeForNull` 不用管" | 默认 `OTHER`，Oracle 上报 `ORA-17004`，必须改 `NULL` 或逐个写 `jdbcType` |
 | "`Plugin#wrap` 里 `@Signature` 写实现类更精确" | `Plugin#invoke` 用 `method.getDeclaringClass()` 匹配，写实现类永不命中，必须写接口 |
 | "多个插件按注册顺序执行" | `pluginAll` 顺序包裹，后注册的在外层，**先执行** |

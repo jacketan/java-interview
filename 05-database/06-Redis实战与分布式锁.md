@@ -8,9 +8,9 @@
 
 | 版本 | 关键变化 | 对本章的影响 |
 | --- | --- | --- |
-| Redis 2.8.9 | `SET key value NX EX` 完整可用 | 单条命令就能拿到锁，不再需要 `SETNX` + `EXPIRE` 两条 |
-| Redis 3.2 | `GEOADD`/`GEORADIUS`、`OBJECT FREQ`、Lua 脚本支持 `redis.replicate_commands()` | GEO 可用；脚本内可调 `TIME` |
-| Redis 4.0 | `UNLINK`、`FLUSHALL ASYNC`、模块（Modules）、LFU 淘汰 | 大 key 异步删除；RedisBloom 以模块形式存在 |
+| Redis 2.6.12 | `SET key value NX EX`/`PX` 完整可用 | 单条命令就能拿到锁，不再需要 `SETNX` + `EXPIRE` 两条 |
+| Redis 3.2 | `GEOADD`/`GEORADIUS`、Lua 脚本支持 `redis.replicate_commands()` | GEO 可用；脚本内可调 `TIME` |
+| Redis 4.0 | `UNLINK`、`FLUSHALL ASYNC`、`OBJECT FREQ`、模块（Modules）、LFU 淘汰 | 大 key 异步删除；RedisBloom 以模块形式存在；`OBJECT FREQ` 需 LFU 策略 |
 | Redis 5.0 | Stream（`XADD`/`XREAD`/`XACK`）、脚本默认 effects replication | 延时队列多一个选项；脚本内写 `TIME` 无需额外声明 |
 | Redis 6.0 | ACL、多线程 IO（`io-threads` 默认 1，即关闭）、`repl-diskless-sync` 默认 `yes` | 吞吐瓶颈从网络 IO 转到命令执行 |
 | Redis 6.2 | `XAUTOCLAIM`、`GEOSEARCH`、`ZRANGE BYSCORE`、`SET` 支持 `GET` | 延时队列与 GEO 的推荐写法变了 |
@@ -95,7 +95,7 @@ Redis 容量规划分三步，面试时把这三步说出来就够了。
 
 **第一步，估数据量。** 写一条脚本对线上抽样：`redis-cli --bigkeys` 看最大 key 的类型分布，`redis-cli --memkeys` 看内存分布（Redis 6.0+ 支持 `--memkeys`），单 key 用 `MEMORY USAGE key SAMPLES 5`。注意 `MEMORY USAGE` 默认采样 5 个元素做外推，元素少时准确，元素多时误差大。
 
-**第二步，估单 key 开销。** Redis 每个 key 都有固定开销：一个 dictEntry 约 24 字节（64 位机器，3 个指针），Redis 7.0 起 dict 改用了不用溢出的实现，`sdshdr5/8/16/32/64` 头部 1~9 字节，jemalloc 按 8/16/32/64/128... 的 size class 分配，所以实际占用总是向上取整。经验值：
+**第二步，估单 key 开销。** Redis 每个 key 都有固定开销：一个 dictEntry 约 24 字节（64 位机器，3 个指针），Redis 7.0 起 dict 改用了不用溢出的实现，`sdshdr5/8/16/32/64` 头部 1~17 字节（分别是 1/3/5/9/17 字节），jemalloc 按 8/16/32/64/128... 的 size class 分配，所以实际占用总是向上取整。经验值：
 
 | 类型 | 单元素经验占用 | 备注 |
 | --- | --- | --- |
@@ -103,7 +103,7 @@ Redis 容量规划分三步，面试时把这三步说出来就够了。
 | Hash | 字段 + 值 + 约 60 字节 | 元素数 ≤ `hash-max-listpack-entries`（默认 128）且单值 ≤ `hash-max-listpack-value`（默认 64）时用 listpack，占用低一个量级 |
 | ZSet | 成员 + 约 64 字节 | skiplist 每层指针平均 1.33 个，元素多时开销显著 |
 | Set（整数） | 约 8~16 字节 | 全整数且 ≤ `set-max-intset-entries`（默认 512）用 intset |
-| List | 元素 + 约 20 字节 | 7.2 前用 quicklist + listpack |
+| List | 元素 + 约 20 字节 | 7.0 起用 quicklist + listpack（7.0 前是 quicklist + ziplist） |
 
 **第三步，留冗余。** `maxmemory` 设置建议为物理内存的 **70%~75%**，剩下 25% 留给：RDB fork 时的 **COW（Copy-On-Write）页复制**、AOF rewrite 的缓冲区、客户端输出缓冲区。fork 期间如果写入量大，COW 可能额外占用与"脏页比例"成正比的内存，极端情况超 50%。所以 `vm.overcommit_memory=1` 是 Redis 部署的硬要求，否则 fork 可能直接失败，日志里出现 `Can't save in background: fork: Cannot allocate memory`。
 
@@ -198,10 +198,11 @@ BF.INFO sku:bloom
 
 反过来的顺序理论上也有窗口，但概率低得多：请求 A 读 DB 旧值 → A 因为 GC/网络卡住 → 请求 B 更新 DB 并删除缓存 → A 恢复并把旧值写回缓存。
 
-这个窗口存在的条件是"A 的读 DB 到写缓存之间的耗时 > B 的整个更新耗时"，概率极低。业界有两条兜底：
+这个窗口存在的条件是"A 的读 DB 到写缓存之间的耗时 > B 的整个更新耗时"，概率极低。业界有三条兜底：
 
 1. **延迟双删**：更新 DB 后删一次缓存，再延迟 500ms~1s（要大于一次读 DB + 写缓存的耗时）删第二次。
 2. **订阅 binlog**：用 Canal 4.x（或 Debezium）订阅 MySQL binlog 变更，由独立消费者删缓存。这是**最终一致性最强的方案**，因为它不依赖业务代码的正确性，所有写路径都被覆盖。
+3. **删缓存失败的重试补偿**：更新 DB 成功后 `DEL` 失败（Redis 抖动、网络超时）时，把 key 投递到 MQ 或写入本地消息表，由消费者重试删除——`DEL` 是幂等的，重试没有副作用。它兜的是"缓存没删掉"这类比并发窗口更常见的故障。
 
 ```mermaid
 sequenceDiagram
@@ -235,7 +236,7 @@ sequenceDiagram
 
 1. **`INCR` 的初值语义**：key 不存在时按 **0** 处理，`INCR` 之后为 1。这条保证"不存在即 0"的语义，不需要先 `SET 0` 再 `INCR`（那样反而有竞态）。
 2. **`INCRBYFLOAT` 用 long double，存在精度问题**，金额统计不要用它，用整数分。
-3. **计数 + 过期必须原子**。`INCR` 之后紧跟的 `EXPIRE` 不是原子的，如果 `INCR` 后进程崩了，key 就永不过期。Redis 7.0 起可用 `SET key 0 EX 60 NX` 预热，或者直接上 Lua。
+3. **计数 + 过期必须原子**。`INCR` 之后紧跟的 `EXPIRE` 不是原子的，如果 `INCR` 后进程崩了，key 就永不过期。可以在计数前用 `SET key 0 EX 60 NX` 预热（`NX`/`EX` 自 Redis 2.6.12 起就支持），或者直接上 Lua（见 4.2 的固定窗口脚本）。
 4. `INCR` 到 `Long.MAX_VALUE`（9223372036854775807）会报 `ERR increment or decrement would overflow`。
 
 ### 4.2 限流算法：四选一的判断依据
@@ -315,7 +316,7 @@ return allowed
 
 1. **`EXPIRE` 的时间要能覆盖桶重新装满的时间**，即 `capacity / rate`，否则 key 提前过期会让桶"瞬间满血"，限流失效。
 2. **`redis.replicate_commands()` 在 Redis 7.0 起是 no-op**。Redis 5.0 起脚本默认按 effects（实际写命令）复制，脚本内调用 `TIME`、`SRANDMEMBER` 这类非确定性命令是安全的。3.2~4.x 才需要显式调用。
-3. **Lua 脚本执行是原子的，但会阻塞整个实例**。脚本里的循环必须有上界，`slowlog-log-slower-than` 默认 10ms，脚本执行超过 `busy-reply-threshold`（默认 5000ms）会打印 `BUSY` 日志。Redis 7.0 起脚本超时不再阻塞，但会记录警告。
+3. **Lua 脚本执行是原子的，但会阻塞整个实例**。脚本里的循环必须有上界，`slowlog-log-slower-than` 默认 10ms，脚本执行超过 `busy-reply-threshold`（默认 5000ms）后其他客户端会收到 `BUSY` 错误，但脚本本身不会被中断（只能 `SCRIPT KILL` 或 `SHUTDOWN NOSAVE`），这一点 Redis 7.0 也没有改变。
 
 ```mermaid
 flowchart TD
@@ -344,7 +345,7 @@ zset 底层是**listpack（7.0 前 ziplist）+ skiplist + dict** 的双结构：
 | --- | --- | --- |
 | `ZADD key score member` | 写入，支持 `NX`/`XX`/`GT`/`LT`/`CH`/`INCR` | O(log N) |
 | `ZINCRBY key delta member` | 分数自增（点赞数、热度分） | O(log N) |
-| `ZREVRANGE key start stop WITHSCORES` | 榜单 Top N（7.0 起推荐 `ZRANGE key start stop REV WITHSCORES`） | O(log N + M) |
+| `ZREVRANGE key start stop WITHSCORES` | 榜单 Top N（6.2 起推荐 `ZRANGE key start stop REV WITHSCORES`） | O(log N + M) |
 | `ZREVRANK key member` | 查排名（从 0 开始），`ZRANK` 是升序 | O(log N) |
 | `ZSCORE key member` | 查分数，走 dict，不是 skiplist | **O(1)** |
 | `ZRANGEBYSCORE key min max WITHSCORES` | 分数段查询 | O(log N + M) |
@@ -402,7 +403,7 @@ delayed.offer("orderId=1001", 30, TimeUnit.MINUTES);
 String task = queue.take();
 ```
 
-底层是 `redisson_delay_queue_timeout:{name}`（zset）+ `redisson_delay_queue:{name}`（list），由 Redisson 内部的定时任务把到期元素从 zset 搬到 list，`take()` 用 `BLPOP` 阻塞等待。它的问题是**延迟任务的搬运依赖单实例的定时器**，且 Redisson 客户端重启后由新实例接管，量级到十万级时 zset 扫描开销明显。
+底层是 `redisson_delay_queue_timeout:{name}`（zset，score 是到期时间戳）+ `redisson_delay_queue:{name}`（list，暂存未到期的原始值），由 Redisson 内部的定时任务把到期元素从 zset `rpush` 进真正的阻塞队列（key 就是用户传入的 name）并 `lrem` 掉 list 里的暂存值，`take()` 用 `BLPOP` 阻塞等待。它的问题是**延迟任务的搬运依赖单实例的定时器**，且 Redisson 客户端重启后由新实例接管，量级到十万级时 zset 扫描开销明显。
 
 ### 6.3 Stream 方案
 
@@ -419,7 +420,7 @@ XAUTOCLAIM order:stream order-group consumer-2 60000 0-0 COUNT 10
 - `>` 表示只读新消息；指定具体 id 表示读该消费者的 Pending 列表（重试自己没 ack 的）。
 - `XPENDING` 两参数形式返回 summary（总数、最小 id、最大 id、各消费者计数）；三参数形式 `XPENDING key group start end count [consumer]` 返回明细。
 - `XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]` 是 Redis **6.2** 引入的，用来替代 `XCLAIM` 的批量版：把空闲超过 `min-idle-time` 毫秒的消息改派给新消费者。这是实现"消费者宕机后消息重新投递"的核心机制。
-- 裁剪用 `XADD key MAXLEN ~ 100000 * ...`，`~` 表示近似裁剪（按整个宏节点裁剪，效率远高于精确裁剪）。7.0 起 `XADD` 不支持 `NOMKSTREAM` 之外的组合变化，`XTRIM` 支持 `MINID`。
+- 裁剪用 `XADD key MAXLEN ~ 100000 * ...`，`~` 表示近似裁剪（按整个宏节点裁剪，效率远高于精确裁剪，代价是长度可能略超阈值）。`XTRIM` 还支持按消息 ID 而非条数裁剪的 `MINID` 策略，可配 `LIMIT` 限制单次裁剪量。
 
 Stream 做延时的限制：**它没有"定时投递"能力**。要做延时必须自己用 zset 存到期时间，到期后再 `XADD` 进 Stream；或者用定时器延迟 ack。所以严格来说 Stream 是"可靠消费"，zset 才是"延时"，两者组合才是完整的延时队列。
 
@@ -522,7 +523,7 @@ BITFIELD sign:uid:1001:202501 GET u31 0
 
 1. **userId 必须映射成紧凑的 offset**。如果 userId 是 19 位雪花 ID，`SETBIT` 的 offset 会到 10^18，远超 2^32-1，直接报错。必须用一层 `userId -> 自增序号` 的映射（放在 Redis Hash 或 DB 里）。
 2. **稀疏 key 也占内存**。`SETBIT key 1000000 1` 会立刻分配 125 KB，因为 Redis 按最大 offset 分配。所以"活跃用户 ID 稀疏"的场景用 Bitmap 反而浪费，改用 HyperLogLog。
-3. **HyperLogLog 的精度与内存**：`PFADD`/`PFCOUNT`/`PFMERGE`，标准误差 **0.81%**，每个 key 固定 **12 KB**（Redis 实现用 16384 个 6 bit 寄存器 = 12 KB）。它只支持基数估计，**不能判断单个元素是否存在**，也没有 `PFEXISTS`。日活百万级时 HLL 比 Bitmap 省内存（Bitmap 需要 userId 上界/8 字节），但 Bitmap 能回答"某用户某天是否活跃"，HLL 不能。
+3. **HyperLogLog 的精度与内存**：`PFADD`/`PFCOUNT`/`PFMERGE`，标准误差 **0.81%**，每个 key 最大 **12 KB**（Redis 用 16384 个 6 bit 寄存器 = 12 KB；基数小时走稀疏编码，默认超过 `hll-sparse-max-bytes`（3000 字节）才转稠密编码）。它只支持基数估计，**不能判断单个元素是否存在**，也没有 `PFEXISTS`。日活百万级时 HLL 比 Bitmap 省内存（Bitmap 需要 userId 上界/8 字节），但 Bitmap 能回答"某用户某天是否活跃"，HLL 不能。
 
 ## 九、附近的人 GEO
 
@@ -543,7 +544,7 @@ GEO 不是独立类型，底层就是 **zset**：`GEOADD` 把经纬度编码成 
 
 Redis 的 GEO 有**两处误差**，必须都讲清楚：
 
-1. **Geohash 编码误差**。52 bit 的 geohash 把经纬度量化到固定网格，纬度范围 180 度分 2^26 份，经度 360 度分 2^26 份，理论定位误差在**厘米级**（0.6 米以内），所以 `GEOPOS` 返回的坐标和写入的有微小差异，这是正常现象。
+1. **Geohash 编码误差**。52 bit 的 geohash 把经纬度量化到固定网格，纬度范围 180 度分 2^26 份，经度 360 度分 2^26 份，理论定位误差在**亚米级**（约 0.6 米以内），所以 `GEOPOS` 返回的坐标和写入的有微小差异，这是正常现象。
 2. **检索的边界误差**。`GEOSEARCH` 的实现是：把查询范围的外接矩形转成 geohash 区间，取中心格 + 周围 **8 个邻居格**，把这 9 个格覆盖的 zset 区间全部取出，再逐条算真实距离过滤。所以：
    - 结果**不遗漏**（9 格覆盖了外接矩形）。
    - 但候选集比实际需要的大，**距离过滤后的 COUNT 限制在候选集上生效**。极端情况下如果 `COUNT` 设得很小、且格子内元素极多，Redis 内部分配的候选缓冲区有上限，可能返回少于 `COUNT` 的结果。
@@ -651,7 +652,7 @@ return tonumber(stock) - tonumber(ARGV[2])
 1. **去重必须在扣减之前判断**，否则同一用户重复扣减会造成"库存被自己吃光"。
 2. **`SADD` 的去重集合会无限增长**。20 万人的秒杀就是 20 万个成员的 set，约 10 MB 以上。更好的做法是用 `SET seckill:user:1001:<uid> 1 EX 86400 NX`，或者用**布隆过滤器**（可容忍极低误判，但误判会导致用户被误拒，秒杀场景一般不接受）。也可以用 Hash + 分片降低单 key 压力。
 3. **库存预热必须做**。秒杀开始前把 DB 库存 `SET seckill:stock:1001 100`，并把 `seckill:users:1001` 清空（`DEL`）。
-4. **Lua 脚本不能超过一定长度**。脚本内容会被完整发送（或先 `SCRIPT LOAD` 拿 SHA1 再 `EVALSHA`）。Spring Data Redis 的 `DefaultRedisScript` 会自动处理 `NOSCRIPT` 错误并回退到 `EVAL`。
+4. **Lua 脚本不能超过一定长度**。脚本内容会被完整发送（或先 `SCRIPT LOAD` 拿 SHA1 再 `EVALSHA`）。Spring Data Redis 的 `DefaultScriptExecutor` 会自动处理 `NOSCRIPT` 错误并回退到 `EVAL`。
 5. **返回值语义要统一**，客户端据此区分"没抢到"和"系统异常"，不要都用 -1。
 
 ### 11.3 完整链路：Redis 预扣 + MQ 异步下单
@@ -762,7 +763,7 @@ SET lock:order:1001 <requestId> NX PX 30000
 
 四个要素缺一不可：
 
-1. **`SET` 单命令**，不能拆成 `SETNX` + `EXPIRE`。中间崩了就永久死锁。`SETNX` + `EXPIRE` 只在 Redis 2.6.12 之前是唯一选择，2.6.12 起 `SET` 支持 `EX`/`NX`，2.8.9 起支持 `PX`。
+1. **`SET` 单命令**，不能拆成 `SETNX` + `EXPIRE`。中间崩了就永久死锁。`SETNX` + `EXPIRE` 只在 Redis 2.6.12 之前是唯一选择，2.6.12 起 `SET` 一次就支持 `EX`/`PX`/`NX`/`XX`（`EX`/`PX`/`NX`/`XX` 没有先后版本差）。
 2. **`value` 必须是唯一标识**，通常是 `UUID.randomUUID() + ":" + Thread.currentThread().getId()`。用固定值（如 `"1"`）会导致误删。
 3. **`NX` 保证互斥**。
 4. **`PX` 保证自动释放**，单位毫秒。用 `EX` 秒级在某些场景粒度太粗。
@@ -814,7 +815,7 @@ end
 | `getLockName(threadId)` | 返回 `UUID + ":" + threadId`，UUID 是 `RedissonLock` 实例级字段 |
 | `getName()` | 锁 key，默认前缀无，`RLock` 的 name 原样使用 |
 | `getChannelName()` | `redisson_lock__channel:{<name>}`，7.x 后按 prefix 生成 |
-| `EXPIRATION_RENEWAL_MAP` | 静态 `ConcurrentMap<String, ExpirationEntry>`，key 是**锁的 id**，用于管理续期任务 |
+| `EXPIRATION_RENEWAL_MAP` | 静态 `ConcurrentMap<String, ExpirationEntry>`，key 是 `entryName`（即 `客户端UUID:锁名`），用于管理续期任务 |
 | `lock()` | 等价于 `lock(-1, null, false)`，`leaseTime = -1` 表示启用看门狗 |
 | `tryLock()` | 默认 `waitTime = -1, leaseTime = -1`，同样启用看门狗 |
 | `lock(long leaseTime, TimeUnit unit)` | 显式指定租期，**不启用看门狗**，到期自动释放 |
@@ -839,8 +840,8 @@ return redis.call('pttl', KEYS[1]);
 
 三点必须讲清楚：
 
-1. **锁结构是 Hash 而非 String**：`key = lockName`，`field = UUID:threadId`，`value = 重入次数`。这个设计同时解决了"可重入"和"多客户端互斥"两个问题——不同客户端的 `field` 不同，所以能共存于同一个 Hash 但语义上互斥（因为 `exists` 判断的是 key 是否存在）。
-2. **返回值语义**：`nil` 表示加锁成功（Lua 的 `nil` 映射到 Redis 的 null bulk reply）；返回一个数字表示失败，数字是当前锁的**剩余 TTL 毫秒数**。Java 侧拿到这个 TTL 后，用它作为 `subscribe` 订阅锁释放频道时的超时参考，实现"等待前一个持有者释放"而不是盲目自旋。
+1. **锁结构是 Hash 而非 String**：`key = lockName`，`field = UUID:threadId`，`value = 重入次数`。这个设计同时解决了"可重入"和"多客户端互斥"两个问题——不同客户端的 `field` 不同，所以能共存于同一个 Hash 但语义上互斥（因为 `exists` 判断的是 key 是否存在）。**代价是锁与线程绑定**：field 里带了 `threadId`，A 线程加的锁只有 A 线程能解，线程池 / 异步回调里跨线程 `unlock()` 会直接抛 `IllegalMonitorStateException`（这是"Redisson 的锁能不能跨线程释放"这道题的标准答案，也是它与裸 `SET NX` 锁的重要差别）。
+2. **返回值语义**：`nil` 表示加锁成功（Lua 的 `nil` 映射到 Redis 的 null bulk reply）；返回一个数字表示失败，数字是当前锁的**剩余 TTL 毫秒数**。Java 侧拿到这个 TTL 后，用它作为等待锁释放的超时（`RedissonLockEntry` 里的 `Semaphore` latch 最多等 ttl 毫秒），实现"等待前一个持有者释放"而不是盲目自旋。
 3. **等待机制是 Pub/Sub 而非自旋**：加锁失败后 `RedissonLock#lock` 会通过 `LockPubSub` 订阅 `getChannelName()`，收到 `UNLOCK_MESSAGE`（常量 `0L`）后重新尝试。解锁时 `publish` 一条消息，所有等待者被唤醒。这比 `while(!tryLock()) sleep(50)` 的轮询好得多，既没有延迟也没有无效 QPS。
 
 ### 14.2 看门狗续期
@@ -903,7 +904,7 @@ return nil;
 - `hexists == 0` 返回 `nil`，Java 侧抛 `IllegalMonitorStateException("attempt to unlock lock, not locked by current thread by node id: ...")`。**所以「解锁别人持有的锁」在 Redisson 里是直接抛异常的**，这比裸写 Lua 更进一步。
 - 重入计数减到 0 才真正 `del` 并 `publish`，否则只刷新 TTL。
 
-**致命细节：解锁一定要放在 `finally` 里，并且不能因为业务异常跳过了 `unlock`**。另一个真实事故是"锁被释放后业务还在跑"——因为 `unlock` 写在 `try` 块里，业务抛出异常前就解锁了。
+**致命细节：解锁一定要放在 `finally` 里，并且不能因为业务异常跳过了 `unlock`**。另一个真实事故是"锁被释放后业务还在跑"——`unlock()` 的调用点必须严格在临界区结束之后，写在临界区中间、或被抽到子方法里提前调用，后面的业务就裸奔了。
 
 ### 14.4 公平锁
 
@@ -914,11 +915,11 @@ return nil;
 | `redisson_lock_queue:{<name>}` | List | 按请求到达顺序存 `UUID:threadId`，实现 FIFO 排队 |
 | `redisson_lock_timeout:{<name>}` | ZSet | score = 排队超时时间戳，用于清理已放弃的等待者，防止队列被死线程占满 |
 
-它的 Lua 会先做"清理队首超时等待者"（`zremrangebyscore` 检查队首元素的超时时间），再判断自己是否是队首。**公平锁的代价是每次加锁多两次数据结构操作**，QPS 下降约 20%~40%，并且如果队首线程长时间阻塞，后面的全部等待——**公平锁用吞吐换公平，非必要不用**。
+它的 Lua 会先做"清理队首超时等待者"（`lindex` 取出队首等待者，`zscore` 查它的超时时间戳，已超时就 `zrem` + `lpop` 出队），再判断自己是否是队首。**公平锁的代价是每次加锁多两次数据结构操作**，QPS 下降约 20%~40%，并且如果队首线程长时间阻塞，后面的全部等待——**公平锁用吞吐换公平，非必要不用**。
 
 ### 14.5 读写锁
 
-`RReadWriteLock` 由 `RedissonReadLock` 与 `RedissonWriteLock` 实现，共用同一个 Hash key `redisson_rwlock:{<name>}`：
+`RReadWriteLock` 由 `RedissonReadLock` 与 `RedissonWriteLock` 实现，共用同一个 Hash key——**key 就是用户传入的 `name`，不加任何前缀**（`redisson_rwlock:{<name>}` 是它们的 Pub/Sub 频道名，即 `getChannelName()` 的返回值，不是 key）：
 
 | 字段 | 值 | 语义 |
 | --- | --- | --- |
@@ -927,8 +928,8 @@ return nil;
 | `{UUID:threadId}:wlock` | 计数 | 该线程持有的写锁次数 |
 
 - 读锁：key 不存在或 `mode = read` 时，`hincrby` 读计数 +1，并创建 `{name}:<序号>` 的辅助 key（用于计数的独立 TTL 管理）。
-- 写锁：key 不存在时 `hset mode write`；如果 `mode = read` 且**自己持有读锁**，允许获取写锁（锁降级），否则返回 `pttl` 失败。
-- 写锁获取要求 `hlen == 1` 且 `mode = write`，即没有其他任何读者或写者。
+- 写锁：key 不存在时 `hset mode write`；`mode = write` 且 field 是自己的写锁时重入计数 +1；`mode = read`（有读者在）时直接返回 `pttl` 失败——这也是"Redisson 读写锁不支持锁升级"的实现层原因。
+- 写锁释放：计数减到 0 时 `hdel` 自己的 field；若此时 `hlen == 1`（只剩 `mode` 字段）就 `del` 整个 key，否则说明自己还持有读锁（写锁降级场景），把 `mode` 改回 `read`。
 
 读写锁的典型用途是"本地缓存与远程配置的刷新"：大量线程读、少量线程写。注意 **Redisson 的读写锁不支持锁升级**（先读锁再写锁会死锁），只支持**锁降级**（持有写锁时可以获取读锁）。
 
@@ -968,7 +969,7 @@ Martin Kleppmann 在 2016 年的文章《How to do distributed locking》里提�
 
 **质疑一：GC 停顿 / 网络延迟会让锁失效。** 客户端 A 在拿到锁后被 STW GC 停顿 30 秒（ttl 只有 10 秒），锁自动过期，客户端 B 拿到锁，A 恢复后以为还持有锁，两个客户端同时写共享资源。**RedLock 无法解决这个问题，因为节点数再多也不能阻止客户端自己的进程暂停。**
 
-**质疑二：RedLock 依赖各节点的时钟。** 锁的有效性依赖"ttl 到期"这个时间判断，如果某个节点的时钟向前跳跃（NTP 校时、虚拟机迁移），锁可能提前失效；如果系统时钟回拨，`SET NX PX` 的行为相对安全（Redis 用单调时钟监控过期），但跨节点的"剩余有效期"计算仍依赖墙上时钟。Kleppmann 的原话是"RedLock 的安全性建立在多个节点时钟同步的假设上，而这个假设不成立"。
+**质疑二：RedLock 依赖各节点的时钟。** 锁的有效性依赖"ttl 到期"这个时间判断，如果某个节点的时钟向前跳跃（NTP 校时、虚拟机迁移），锁可能提前失效；如果系统时钟回拨，`SET NX PX` 反而相对安全（TTL 在写入时就换算成了绝对时间戳，回拨只会让锁活得更久，真正危险的是时钟向前跳），但跨节点的"剩余有效期"计算仍依赖墙上时钟。Kleppmann 的原话是"RedLock 的安全性建立在多个节点时钟同步的假设上，而这个假设不成立"。
 
 **Kleppmann 给出的正解是 fencing token（栅栏令牌）**：每次加锁返回一个**单调递增**的数字，写共享资源时带上这个 token，**存储层拒绝比已见过的最大 token 更小的写入**。这样即使两个客户端同时以为持有锁，只有 token 大的那个能写成功。他甚至建议直接用 ZooKeeper/etcd（因为它们提供单调递增的 `zxid`/`revision`）而不是 Redis。
 
@@ -989,7 +990,7 @@ Martin Kleppmann 在 2016 年的文章《How to do distributed locking》里提�
 | 业务超时锁提前释放 | ttl 30s，业务跑 35s，B 拿到锁，A 恢复后继续写 | 看门狗续期；业务侧加"锁是否仍属于我"校验 |
 | 主从切换丢锁 | 主节点写入锁后未同步到从节点即宕机，从升主后锁消失 | `WAIT 1 100` 同步等待至少 1 个从节点 ack；或 RedLock；或接受并靠业务幂等 |
 | GC 停顿丢锁 | Full GC 停顿 8s，锁 ttl 5s | ttl 远大于最大 GC 停顿；换 G1/ZGC 降低停顿；业务幂等 |
-| 时钟漂移 | NTP 向前跳跃导致 TTL 提前到期 | Redis 用单调时钟做过期判断（`mstime`），但仍应禁用大幅 NTP 跳变，用 `-x` 渐进校时 |
+| 时钟漂移 | NTP 向前跳跃导致 TTL 提前到期 | 过期时间存的是绝对时间戳（`mstime`，墙上时钟，不是单调时钟），向前跳会提前放锁、回拨会延长锁；应禁用大幅 NTP 跳变，用 `-x` 渐进校时 |
 | 误删他人锁 | 没用唯一 value，或释放非原子 | 唯一 value + Lua 原子释放 |
 | 锁忘记释放 | 异常路径跳过 `unlock` | `try/finally`；`tryLock` 判断返回值 |
 
@@ -1088,6 +1089,7 @@ flowchart TD
     C1["Lua 原子扣减库存与用户去重"]
     C2["发送 MQ 消息"]
     C3["返回排队中"]
+    C4["直接返回失败: 库存不足或重复下单"]
   end
   subgraph L4["异步层"]
     D1["订单消费者条件扣减 DB 库存"]
@@ -1104,7 +1106,8 @@ flowchart TD
   B2 --> B3
   B3 --> C1
   C1 -->|"成功"| C2
-  C1 -->|"失败"| C3
+  C2 --> C3
+  C1 -->|"失败"| C4
   C2 --> D1
   C3 --> E2
   D1 --> E1
@@ -1174,7 +1177,7 @@ flowchart TD
 1. **QPS 上来**：单实例到 10 万 QPS 后，瓶颈从内存转向**网络 IO 与单核命令执行**。手段依次是：Pipeline 批量化 → 客户端读写分离（从节点读）→ Redis 6.0 多线程 IO（`io-threads 4`，仅 IO 多线程，命令执行仍单线程）→ Redis Cluster 分片。
 2. **数据量上来**：单实例 `maxmemory` 建议不超过 32 GB，超过后 RDB fork 与全量同步的耗时与内存翻倍增长（`fork` 复制页表，48 GB 实例 fork 可耗时数百毫秒到秒级）。超过 32 GB 就分片。
 3. **节点变多**：Cluster 模式引入 **16384 slot 的迁移与 `MOVED`/`ASK` 重定向**，客户端需要正确处理；多 key 操作必须同 slot（hash tag）；事务与 Lua 不能跨 slot；`KEYS`/`SCAN` 只能遍历当前节点。运维复杂度显著上升。
-4. **热点 key**：单个 key 的 QPS 有物理上限（单核），必须拆分——比如库存 key 拆成 10 份 `seckill:{1001}:stock:{0..9}`，请求按 `hash(uid) % 10` 路由，余额存在一个汇总 key 里异步合并，或者每份独立分配库存。
+4. **热点 key**：单个 key 的 QPS 有物理上限（单核），必须拆分——比如库存 key 拆成 10 份 `seckill:stock:{1001:0}` ~ `seckill:stock:{1001:9}`，请求按 `hash(uid) % 10` 路由，余额存在一个汇总 key 里异步合并，或者每份独立分配库存。注意这 10 份要用**不同的 hash tag** 才能散到不同分片；如果写成 `seckill:{1001}:stock:0` 这种共用 tag 的形式，10 个 key 仍在同一个 slot，拆了等于没拆（11.6 节共用 tag 是为了让一个 Lua 的 KEYS 同 slot，目的不同）。
 5. **锁的规模**：锁数量从千级涨到百万级后，`EXPIRATION_RENEWAL_MAP` 的定时任务数量与 `PUBSUB` 频道数量都会成为客户端侧的负担（Redisson 每个锁一个定时任务 + 一个订阅）。这是"每个用户一个锁"设计的典型失效模式，正确做法是**按资源维度加锁（如订单维度）而不是按用户维度**，让锁的并发度与业务冲突度匹配。
 
 ## 高频面试题
@@ -1308,9 +1311,9 @@ flowchart TD
 Lua 在 Redis 上的其他坑：
 1. **脚本必须声明所有 key 在 `KEYS` 数组里**，不能把 key 拼进 `ARGV`。否则集群代理无法正确路由，且 Redis 7.0 起有 `lua-emit-write` 语义校验的风险。
 2. **脚本不能有超过几百 KB 的内容**：脚本执行时间上限由 `busy-reply-threshold` 控制（默认 **5000 ms**，Redis 6.2 之前叫 `lua-time-limit`），超时后 Redis 对其他客户端返回 `BUSY` 错误，但仍会继续执行完脚本（不会中断），此时只能 `SCRIPT KILL`（仅限脚本尚未写入数据）或 `SHUTDOWN NOSAVE`。
-3. **`EVALSHA` 的 `NOSCRIPT` 错误**：脚本缓存可能在 `SCRIPT FLUSH`、主从切换、实例重启后丢失。Spring Data Redis 的 `DefaultRedisScript` 会自动回退到 `EVAL`；自己封装的话必须处理。
+3. **`EVALSHA` 的 `NOSCRIPT` 错误**：脚本缓存可能在 `SCRIPT FLUSH`、主从切换、实例重启后丢失。Spring Data Redis 的 `DefaultScriptExecutor` 会自动回退到 `EVAL`；自己封装的话必须处理。脚本缓存既不持久化也不复制，所以 Redis 7.0 起更推荐用 **Functions**（`FUNCTION LOAD` + `FCALL`）：函数库随 RDB/AOF 持久化并复制到从节点，不必每次发脚本体，也不用赌 SHA1 还在缓存里。
 4. **不能用 `RANDOMKEY`、`KEYS`**（非确定性且代价高）。
-5. **脚本内的错误不会回滚已执行的写命令**——Lua 不是事务，`redis.call` 在中途报错时前面的写已经生效（7.0 起可以用 `redis.pcall` 捕获，或者用 `redis.setresp(3)` 配合 `redis.set_repl`）。这一点经常被误答成"Lua 有事务回滚"。
+5. **脚本内的错误不会回滚已执行的写命令**——Lua 不是事务，`redis.call` 在中途报错时前面的写已经生效（`redis.pcall` 只是把错误当返回值交回脚本、让脚本继续往下跑，同样不回滚）。这一点经常被误答成"Lua 有事务回滚"。
 
 **追问**：那 `MULTI/EXEC` 能回滚吗？答：也不能。Redis 的事务只保证"命令顺序执行不被插入"，`EXEC` 中某条命令报错，其余命令照样执行，没有回滚能力。这与 MySQL 事务根本不同。
 
@@ -1329,7 +1332,7 @@ Lua 在 Redis 上的其他坑：
 
 ### Q13. 布隆过滤器、HyperLogLog、Bitmap、GEO 底层分别是什么数据结构？各自局限是什么？
 
-**答题框架（30 秒版）**：布隆是**位数组 + 多个哈希函数**（Redis 里以 String 实现，对外是 `BF.*` 模块命令）；HyperLogLog 是**16384 个 6 bit 寄存器的概率基数估计**（固定 12 KB，误差 0.81%）；Bitmap 是 **String 的位操作**（最大 offset 2^32-1，即 512 MB）；GEO 是 **zset**（score 是 52 bit geohash 整数）。
+**答题框架（30 秒版）**：布隆是**位数组 + 多个哈希函数**（Redis 里以 String 实现，对外是 `BF.*` 模块命令）；HyperLogLog 是**16384 个 6 bit 寄存器的概率基数估计**（最大 12 KB，误差 0.81%）；Bitmap 是 **String 的位操作**（最大 offset 2^32-1，即 512 MB）；GEO 是 **zset**（score 是 52 bit geohash 整数）。
 
 **展开（2 分钟版）**：
 1. 布隆：只能判"一定不存在"，不能判"一定存在"；不支持删除；`BF.RESERVE` 的 `capacity` 默认只有 100，必须显式指定。
@@ -1341,7 +1344,7 @@ Lua 在 Redis 上的其他坑：
 
 ### Q14. Redisson 的读写锁和公平锁怎么实现的？什么时候用？
 
-**答题框架（30 秒版）**：读写锁共用一个 Hash `redisson_rwlock:{name}`，用 `mode` 字段区分 `read`/`write`，读锁用 `{UUID:threadId}:rlock` 计数，写锁用 `{UUID:threadId}:wlock` 计数；写锁要求没有其他读者或写者。公平锁在 `RedissonLock` 基础上加了 `redisson_lock_queue:{name}` List 和 `redisson_lock_timeout:{name}` ZSet 实现 FIFO 与超时清理。
+**答题框架（30 秒版）**：读写锁共用一个 Hash（key 就是用户传入的 name，不加前缀），用 `mode` 字段区分 `read`/`write`，读锁用 `{UUID:threadId}:rlock` 计数，写锁用 `{UUID:threadId}:wlock` 计数；写锁要求没有其他读者或写者。公平锁在 `RedissonLock` 基础上加了 `redisson_lock_queue:{name}` List 和 `redisson_lock_timeout:{name}` ZSet 实现 FIFO 与超时清理。
 
 **展开（2 分钟版）**：
 1. 读写锁只支持**锁降级**（持写锁时可再拿读锁），**不支持锁升级**（持读锁再拿写锁会死锁，因为自己持有的读锁阻塞了写锁的获取）。
@@ -1349,13 +1352,13 @@ Lua 在 Redis 上的其他坑：
 3. 公平锁用吞吐换公平，每次加锁多两次结构操作，QPS 下降 20%~40%；只有"必须严格按请求顺序执行"（如顺序流水、按序清算）才用。
 4. 公平锁的排队者如果超时未拿到锁，要靠 `redisson_lock_timeout` 里的 score 清理，否则队列会被死线程占满。
 
-**追问**：`RLock` 和 `RReadWriteLock` 的 key 前缀是什么？答：`RLock` 无固定前缀，`RReadWriteLock` 是 `redisson_rwlock:{name}`，信号量是 `redisson_semaphore:{name}`，闭锁是 `redisson_countdownlatch:{name}`。
+**追问**：`RLock` 和 `RReadWriteLock` 的 key 前缀是什么？答：`RLock`、`RReadWriteLock`、`RSemaphore`、`RCountDownLatch` 的 key 都是用户传入的 name，**一律没有固定前缀**（读写锁也共用这一个 Hash，靠 `mode` 字段同时存模式与读写计数）。有区别的是**频道名**：`RLock` 是 `redisson_lock__channel:{name}`，`RReadWriteLock` 是 `redisson_rwlock:{name}`，信号量是 `redisson_sc:{name}`——别把 `redisson_rwlock:{name}` 当成读写锁的 key，它是 `getChannelName()` 返回的频道名。
 
 ## 易错点与踩坑
 
 | 易错点 | 正确理解 |
 | --- | --- |
-| `SETNX` + `EXPIRE` 做锁 | 非原子，中间崩溃永久死锁；必须用 `SET key value NX PX ms`（2.6.12+/2.8.9+） |
+| `SETNX` + `EXPIRE` 做锁 | 非原子，中间崩溃永久死锁；必须用 `SET key value NX PX ms`（`EX`/`PX`/`NX`/`XX` 均自 Redis 2.6.12 起支持） |
 | 释放锁用 `GET` 后 `DEL` | 两步非原子，中间锁过期会删掉别人的锁；必须用 Lua |
 | `tryLock` 不检查返回值 | 拿不到锁继续执行临界区，锁等于没加 |
 | `lock(10, SECONDS)` 以为更安全 | 显式传 `leaseTime` 会**关闭看门狗**，业务超时后锁必然提前释放 |

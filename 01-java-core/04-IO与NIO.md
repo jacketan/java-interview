@@ -27,10 +27,11 @@
 | JDK 6 及更早 | Linux 上 `Selector` 基于 `poll` | `sun.nio.ch.PollSelectorImpl`，fd 多时性能差 |
 | JDK 7 (2011) | JSR 203 `java.nio.file`，`AsynchronousChannel`/`Files`/`Path`/`WatchService`；Linux 上 `SelectorProvider` 默认切到 epoll | AIO、文件属性、目录监听（Linux inotify）、多路复用性能台阶 |
 | JDK 8 | `AsynchronousFileChannel` 常用于大文件；`sun.misc.Unsafe` 仍可释放直接内存 | `-XX:MaxDirectMemorySize` 语义成熟 |
-| JDK 9 (2017) | `Buffer#flip/clear/rewind/position/limit` 增加返回子类型的覆盖方法 | `ByteBuffer b = buf.flip()` 可链式调用，不再需要强转 |
+| JDK 9 (2017) | `ByteBuffer`/`CharBuffer` 等**子类**为 `flip`/`clear`/`rewind`/`position`/`limit` 增加返回子类型的覆盖方法（`Buffer` 上的同名方法同时去掉 `final`） | `ByteBuffer b = buf.flip()` 可链式调用，不再需要强转；注意 `Buffer` 自带的这些方法返回的仍是 `Buffer` |
+| JDK 9 | `InputStream#readAllBytes`/`readNBytes`/`transferTo` | 小文件一次读完、流对拷不再需要第三方 `IOUtils` |
 | JDK 9 | `jdk.internal.ref.Cleaner` 取代 `sun.misc.Cleaner`；`Unsafe.invokeCleaner` 公开 | 直接内存释放方式变化，旧反射代码失效 |
 | JDK 9 | JEP 290 序列化过滤（backport 到 8u121） | `ObjectInputFilter`、`jdk.serialFilter` |
-| JDK 16 / 17 | JEP 396 默认强封装 JDK 内部 API | 反射替换 `selectedKeys` 一类的优化受限，老版本 Netty 升级要验证 |
+| JDK 16 起 | JEP 396 默认强封装 JDK 内部 API | 反射替换 `selectedKeys` 一类的优化受限，老版本 Netty 升级要验证 |
 | JDK 21 | JEP 444 虚拟线程正式 | `Executors.newVirtualThreadPerTaskExecutor()`，BIO 模型重新可用 |
 | JDK 24 | JEP 491 移除 `synchronized` 对虚拟线程的 pinning | 需 JDK 24 才彻底解决载体线程被占用 |
 
@@ -271,10 +272,10 @@ ET 的三个具体陷阱：
 
 - Linux 上 `SelectorProvider#provider()` 返回 `EPollSelectorProvider`，`openSelector()` 得到 `sun.nio.ch.EPollSelectorImpl`（JDK 7 起；JDK 6 及更早是 `PollSelectorImpl`，Solaris 用 `DevPollSelectorImpl`）。
 - JDK 的 epoll 使用 **LT 模式**，没有对外暴露 `EPOLLET`；要 ET 必须用 Netty 的 native transport（`io.netty:netty-transport-native-epoll` + `EpollEventLoopGroup`）。
-- **空轮询 bug**：部分内核版本下 `epoll_wait` 返回 0 但 `selectedKeys` 非空（或 select 提前返回），JDK 6/7 会把阻塞式 `select` 变成忙循环，CPU 打到 100%。Netty 在 `NioEventLoop#select` 中用 `selectCnt` 计数，连续超过 `SELECTOR_AUTO_REBUILD_THRESHOLD`（默认 512）就重建 `Selector`，阈值可用 `io.netty.selectorAutoRebuildThreshold` 覆盖，设为 0 表示关闭该保护。
+- **空轮询 bug**：部分内核版本下 `epoll_wait` 返回 0 但 `selectedKeys` 非空（或 select 提前返回），会把阻塞式 `select` 变成忙循环，CPU 打到 100%。这个坑 JDK 6/7 时代就存在，Netty 4.1 至今仍保留兜底：`NioEventLoop#select` 用 `selectCnt` 计数，连续超过 `SELECTOR_AUTO_REBUILD_THRESHOLD`（默认 512）就重建 `Selector`，阈值可用 `io.netty.selectorAutoRebuildThreshold` 覆盖，设为 0 表示关闭该保护。
 - 在 JDK 9+ 模块化下，Netty 反射替换 `sun.nio.ch.SelectorImpl#selectedKeys` 为 `SelectedSelectionKeySet`（数组实现）的优化可能受强封装限制；失败只影响性能，不影响功能，需要时用 `--add-opens java.base/sun.nio.ch=ALL-UNNAMED`。
-- `Selector#select()` 返回值是"自上次 select 以来就绪操作集发生变化的 key 数量"，`selectNow()` 不阻塞，`select(timeout)` 返回 0 也可能是超时。
-- `wakeup()` 让阻塞中的 `select` 立即返回，语义是"下一次 `select` 立即返回、不再阻塞"。并发场景下有经典竞态：调用方先 `wakeup()` 再提交任务，任务提交时目标线程可能刚刚判断完队列为空并即将进入 `select`，于是这次唤醒被"吃掉"，任务要等到下一次超时或事件才执行。Netty 用 `AtomicBoolean wakenUp` 配合 `selectNow()` 兜底解决。
+- `Selector#select()` 返回的是**本次 selection 中就绪操作集被更新的 key 数量**（Javadoc 原文 "whose ready-operation sets were updated"），不等于 `selectedKeys.size()`；`selectNow()` 不阻塞，`select(timeout)` 返回 0 也可能是超时。
+- `wakeup()` 让阻塞中的 `select` 立即返回，语义是"下一次 `select` 立即返回、不再阻塞"。并发场景下有经典竞态：调用方先 `wakeup()` 再提交任务，任务提交时目标线程可能刚刚判断完队列为空并即将进入 `select`，于是这次唤醒被"吃掉"，任务要等到下一次超时或事件才执行。Netty 用一个唤醒标记（早期 4.1.x 是 `AtomicBoolean wakenUp`，较新的 4.1.x 换成了 `AtomicLong nextWakeupNanos`）配合 `selectNow()` 兜底解决。
 
 ## 四、Java NIO 三大组件
 
@@ -352,7 +353,7 @@ stateDiagram-v2
 
 补充 API 语义：
 
-- `slice()`：从当前 position 到 limit 切一段**共享内存**的视图，position 归零，引用计数共享。
+- `slice()`：从当前 position 到 limit 切一段**共享底层内存**的视图（新 buffer 的 position 归零、limit 等于剩余量，改一处另一处可见），但 position/limit/mark 各自独立——`java.nio` 的 `ByteBuffer` 没有引用计数，别和 Netty `ByteBuf` 的 `retain()` 混在一起。
 - `duplicate()`：复制索引状态，共享内容。
 - `asReadOnlyBuffer()`：只读视图。
 - `order(ByteOrder)`：字节序，网络协议固定用 `ByteOrder.BIG_ENDIAN`（大端）。
@@ -373,7 +374,7 @@ stateDiagram-v2
 
 - `-XX:MaxDirectMemorySize` 默认为 0，含义是"不单独限制，等同于 `Runtime.getRuntime().maxMemory()`"，即最多可占用与 `-Xmx` 相当的堆外内存。所以**大堆 + 大量 Netty 直接内存的进程，实际 RSS 可能是 `Xmx` 的两倍**，容器里极易被 OOMKilled。
 - JDK 8 的 `DirectByteBuffer` 构造器里 `Bits.reserveMemory(size, cap)` 记账，超限时先 `System.gc()` 并短暂重试，仍不足才抛 `OutOfMemoryError: Direct buffer memory`。如果启动了 `-XX:+DisableExplicitGC`，这条自救路径被切断，压力会直接变成硬 OOM。
-- JDK 9 起释放由 `jdk.internal.ref.Cleaner`（`CleanerFactory.cleaner()`）完成，手动释放走 `sun.misc.Unsafe#invokeCleaner(ByteBuffer)`（JDK 9+ 公开该 API）；JDK 8 只能用 `sun.misc.Cleaner` 反射，代码在升级时会直接报 `InaccessibleObjectException`。
+- JDK 9 起释放由 `jdk.internal.ref.Cleaner` 完成（`DirectByteBuffer` 构造器里是 `Cleaner.create(this, new Deallocator(...))`，`CleanerFactory.cleaner()` 是 `FileChannelImpl`、`ZipFile` 等内部类在用的形式）；手动释放走 `sun.misc.Unsafe#invokeCleaner(ByteBuffer)`（JDK 9+ 公开该 API）；JDK 8 只能反射 `sun.misc.Cleaner`，而该类在 JDK 9 已被移除，所以升级后是**运行时**才失败（类不存在，或深反射被模块系统拒绝时抛 `InaccessibleObjectException`），不会是编译期报错。
 - 观测手段：`ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class)` 对应 JMX 的 `java.nio:type=BufferPool,name=direct`，可拿到 `getCount()`、`getMemoryUsed()`、`getTotalCapacity()`；NMT（`-XX:NativeMemoryTracking=detail` + `jcmd <pid> VM.native_memory summary`）用于核对堆外内存总量是否与直接内存账目吻合。
 
 ```mermaid
@@ -412,7 +413,7 @@ flowchart TD
 
 必背规则：
 
-1. **`selectedKeys()` 迭代时必须 `iterator.remove()`**，否则该 key 会在下次 `select()` 时再次出现在集合里，造成重复处理；严重时集合只增不减，业务逻辑空转。
+1. **`selectedKeys()` 迭代时必须 `iterator.remove()`**，否则该 key 会**一直留在集合里**（Javadoc 明确：除了显式 `remove`，selection 操作不会清理 selected-key set），下一轮被当成就绪 key 重复处理；严重时集合只增不减，业务逻辑空转。
 2. **`OP_WRITE` 不要长期注册**。socket 发送缓冲区有空间时 `OP_WRITE` 恒为就绪，`select` 会立刻返回，线程 100% 空转。正确做法：写不出去时注册 `OP_WRITE`，写完立刻取消。
 3. **`key.cancel()` 只是标记**，真正的注销发生在下一次 `select()`，所以要保证 `select` 会被调用（用 `wakeup()`）。
 4. 通道被关闭、key 失效后调用 `key.interestOps()` 会抛 `CancelledKeyException`，处理事件前先 `key.isValid()`。
@@ -458,7 +459,7 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | `mmap` + `write` | `mmap` + `write` | 3（页缓存→socket 缓冲区仍是 CPU 拷贝） | 4 | 大文件映射引发大量缺页中断与内存压力 |
 | `sendfile` | `sendfile` | 2（支持 SG-DMA 时全 DMA） | 2 | 输入必须是文件，无法在途中修改数据 |
-| `splice` | `splice` | 2（经管道，无需硬件 SG-DMA） | 2 | 需要一个管道 fd，Linux 2.6.17 起 |
+| `splice` | `splice` | 2（经管道，无需硬件 SG-DMA） | 2 | 需要一个管道 fd，Linux 2.6.17 起；**Java 层没有对应 API**，只能靠 JNI |
 | `MSG_ZEROCOPY` | `send` + `MSG_ZEROCOPY` | 1 | 2 | 需要网卡与内核支持，通知机制复杂 |
 
 补充两个硬限制：
@@ -484,7 +485,7 @@ while (position < size) {
 
 - `FileChannel#transferTo(long position, long count, WritableByteChannel target)`：Linux 下走 `sendfile`，Windows 走 `TransmitFile`。
 - `FileChannel#transferFrom(ReadableByteChannel src, long position, long count)`：源必须是 `FileChannel` 才可能零拷贝。
-- 单次内核 `sendfile` 有上限（Linux 上约 2GB），`FileChannelImpl` 内部会分片循环，但**返回值可能小于请求长度、甚至为 0**，调用方必须循环并处理 0 的情况。
+- 单次内核 `sendfile` 有上限（Linux 上约 2GB），`FileChannelImpl#transferTo` 也把单次 `count` 截断到 `Integer.MAX_VALUE` 且**不做内部循环重试**（JDK 8 源码里 sendfile 路径 `transferToDirectly` 只有 EINTR 重试、不做分片循环，分片循环出现在 mmap 兜底路径 `transferToTrustedChannel` 中），所以**返回值可能小于请求长度、甚至为 0**，调用方必须循环并处理 0 的情况。
 - `FileChannel#map(MapMode, position, size)` 返回 `MappedByteBuffer`：单次映射大小不能超过 `Integer.MAX_VALUE`（约 2GB），本质是 `mmap`。
 - `MappedByteBuffer#force()` 强制刷盘；**没有 `close()`**，解除映射只能等 GC 回收后由 `Cleaner` 调用 `munmap`，长生命周期场景累积映射会导致虚拟内存与 RSS 上涨。
 
@@ -554,14 +555,14 @@ classDiagram
 - `InputStreamReader`/`OutputStreamWriter` 是"装饰器 + 适配器"叠加，负责字节到字符的解码；`FileReader` 用平台默认字符集，**多环境部署必须显式指定 `StandardCharsets.UTF_8`**，否则 JDK 18 之前用默认字符集、JDK 18 起 `file.encoding` 默认 UTF-8。
 - `ObjectInputStream` 直接继承 `InputStream` 而不是 `FilterInputStream`，因为它需要按自己的协议读取原始字节。
 
-**Socket 上的坑**：给 `Socket#getInputStream()` 套 `BufferedInputStream` 后调用 `read()`，如果对端只发了 10 字节而后继续等待应答，`BufferedInputStream` 会因"要填满 8KB 或读到 EOF"而阻塞在底层 `read`，导致协议死锁。长连接协议要么自己按帧长读，要么用 `DataInputStream#readFully`。
+**Socket 上的坑**：先纠正一个流传很广的说法——`BufferedInputStream` **不会**为了填满 8KB 而阻塞：`fill()` 只调用一次底层 `read`（`getInIfOpen().read(buffer, pos, buffer.length - pos)`），而 socket 的 `read` 有数据就返回。真正的两个坑是：① `read(byte[])` 是**短读**，返回字节数可能小于请求长度，代码若按"循环读到 N 字节"来写协议，对端只发 10 字节就等应答时会死等；② **混用带缓冲与不带缓冲的读**——`BufferedInputStream` 会预读并把数据吞进自己的缓冲区，绕过它直接读底层 `Socket` 流的那次读就会丢数据。长连接协议要么自己按帧长读，要么统一用 `DataInputStream#readFully`。
 
 ### 6.2 Serializable 与 serialVersionUID
 
 | 项 | 规则 |
 | --- | --- |
 | 标记接口 | `java.io.Serializable`，无方法，仅编译期/运行期判断 |
-| `serialVersionUID` | 显式声明 `private static final long serialVersionUID = 1L;`，否则由 `ObjectStreamClass#computeDefaultSUID` 按类名/修饰符/接口/字段/构造器/静态初始化器算 SHA-1 |
+| `serialVersionUID` | 显式声明 `private static final long serialVersionUID = 1L;`，否则由 `ObjectStreamClass#computeDefaultSUID` 按类名/修饰符/接口/字段/静态初始化器/构造器/**方法**算 SHA-1 |
 | 不匹配的后果 | `InvalidClassException: local class incompatible: stream classdesc serialVersionUID = x, local class serialVersionUID = y` |
 | `transient` | 该字段不参与序列化，反序列化后为默认值（对象为 null，int 为 0） |
 | `static` 字段 | 属于类不属于对象，不参与序列化 |
@@ -610,7 +611,7 @@ ObjectInputFilter filter = ObjectInputFilter.Config.createFilter(
 ObjectInputFilter.Config.setSerialFilter(filter);
 ```
 
-注意：`ObjectInputFilter.Config.setSerialFilter` 只能设置一次，第二次抛 `IllegalStateException`，这在"框架 + 业务都要设置过滤器"的场景是常见冲突源。
+注意：`ObjectInputFilter.Config.setSerialFilter` 只能设置一次，第二次抛 `IllegalStateException`，这在"框架 + 业务都要设置过滤器"的场景是常见冲突源。JDK 17 起新增了 `ObjectInputFilter.Config.setSerialFilterFactory(BinaryOperator<ObjectInputFilter>)`：过滤器工厂会在每个 `ObjectInputStream` 创建（以及设置流级过滤器）时被调用，由它把"JVM 级静态过滤器 + 流级过滤器"合成，从根上解掉"只能设一次"的限制。
 
 ## 七、Netty
 
@@ -664,11 +665,11 @@ flowchart TD
 | boss 线程数 | 构造时显式给 1 | 只有一个 listen fd，多线程无益还有惊群风险 |
 | `ioRatio` | 50 | `NioEventLoop#run` 中 IO 时间与任务时间的比例 |
 | 单次 `select` 阻塞多久 | 由最近一个定时任务的到期时间决定；队列里有任务时先 `selectNow` 立即返回 | `NioEventLoop#select` 与 `DefaultSelectStrategy`，保证定时任务与提交任务不被饿死 |
-| `SO_BACKLOG` | `NetUtil.SOMAXCONN`（常量为 128，实际取内核 `somaxconn` 与设置值较小者） | 高并发时应显式设为 1024 以上并同步调内核参数 |
+| `SO_BACKLOG` | `NetUtil.SOMAXCONN`（优先读 `/proc/sys/net/core/somaxconn`，读不到时按平台回退：Linux 4096、macOS 128、Windows 200；实际生效值再与设置值取较小者） | 高并发时应显式设为 1024 以上并同步调内核参数 |
 | `TCP_NODELAY` | `true`（Netty 对 `SocketChannel` 默认开启） | 关闭 Nagle 算法，降低小包延迟 |
 | `SO_KEEPALIVE` | `false` | 靠 `IdleStateHandler` 做应用层心跳更可控 |
 | `WRITE_BUFFER_WATER_MARK` | 低 32KB / 高 64KB（`WriteBufferWaterMark.DEFAULT`） | `isWritable()` 的判定依据，用于反压 |
-| `RCVBUF_ALLOCATOR` | `AdaptiveRecvByteBufAllocator.DEFAULT`（最小 64、初始 1024、最大 65536） | 自适应接收缓冲区，小包省内存大包少 syscall |
+| `RCVBUF_ALLOCATOR` | `AdaptiveRecvByteBufAllocator.DEFAULT`（最小 64、最大 65536，初始值较新的 4.1.x 是 2048、早期版本是 1024） | 自适应接收缓冲区，小包省内存大包少 syscall |
 | `ResourceLeakDetector` 级别 | `SIMPLE` | 可调 `io.netty.leakDetection.level=paranoid` |
 
 为什么 EventLoop 内部可以不用锁：一个 `Channel` 从注册那一刻起就绑定到唯一 `EventLoop`，其生命周期内所有事件都在同一个线程上串行执行，业务 Handler 因此天然是"单线程模型"，不需要加 `synchronized`。跨 `EventLoop` 提交任务时用 `channel.eventLoop().execute(task)`，返回 Promise 而不是直接阻塞等待。
@@ -690,7 +691,7 @@ flowchart TD
 
 1. `UnpooledHeapByteBuf`：堆内数组，分配快，做 IO 多一次拷贝。
 2. `UnpooledDirectByteBuf`：堆外内存，适合 IO。
-3. `PooledByteBuf`（`PooledDirectByteBuf`/`PooledHeapByteBuf`）：`PooledByteBufAllocator` 默认分配器，jemalloc 风格，`PoolArena` → `PoolChunk`（默认 `chunkSize=16MB`、`pageSize=8KB`、`maxOrder=11`）→ 完全二叉树位图分配，`tinyCacheSize=512`、`smallCacheSize=256`、`normalCacheSize=64` 的线程缓存减少锁竞争。
+3. `PooledByteBuf`（`PooledDirectByteBuf`/`PooledHeapByteBuf`）：`PooledByteBufAllocator` 默认分配器，jemalloc 风格，`PoolArena` → `PoolChunk`（`pageSize` 默认 8KB，`chunkSize = pageSize << maxOrder`）→ 完全二叉树位图分配，再配 `tinyCacheSize`/`smallCacheSize`/`normalCacheSize` 线程缓存减少锁竞争。**这几个默认值改过版本**：较新的 4.1.x（如 4.1.12x）是 `maxOrder=9`（chunk 4MB）+ `tinyCacheSize=0`（tiny 缓存默认关闭），早期 4.1.x（如 4.1.25）是 `maxOrder=11`（chunk 16MB）+ `tinyCacheSize=512`；`smallCacheSize=256`、`normalCacheSize=64` 两版一致，都可用 `io.netty.allocator.*` 覆盖。
 4. `CompositeByteBuf`：把多个 `ByteBuf` 组合成一个逻辑视图，**不拷贝数据**，用于"头部 + body"场景。
 
 其他要点：
@@ -698,7 +699,7 @@ flowchart TD
 - `slice()`/`duplicate()` 共享底层内存且**共享引用计数**，必须配合 `retain()`；`retainedSlice()` 是二者合一。
 - `readRetainedSlice()` 与 `slice()` 的区别只在引用计数是否加 1，是内存泄漏的高发区。
 - `ByteBufAllocator.DEFAULT` 在 4.1 中是池化分配器；可用 `-Dio.netty.allocator.type=unpooled` 切回非池化（排查问题时常用）。
-- `Arena` 数量默认为 `min(CPU 核数, 可用内存 / chunkSize / 6)`，可用 `io.netty.allocator.numDirectArenas` 与 `numHeapArenas` 覆盖。
+- `Arena` 数量默认为 `min(2 × CPU 核数, 内存上限 / chunkSize / 2 / 3)`（即除以 6），其中堆 Arena 用 `Runtime.maxMemory()`、直接内存 Arena 用 `PlatformDependent.maxDirectMemory()`；可用 `io.netty.allocator.numDirectArenas` 与 `numHeapArenas` 覆盖。
 
 ### 7.5 粘包与拆包
 
@@ -883,7 +884,7 @@ new LengthFieldBasedFrameDecoder(1024 * 1024, 0, 4, 0, 4);
 **答题框架（30 秒版）**：用"定长头 + 变长体"，头部含魔数、版本、序列化类型、消息类型、请求 ID、body 长度；解码用 `LengthFieldBasedFrameDecoder`，编码用自定义 `MessageToByteEncoder`。
 
 **展开（2 分钟版）**：
-1. 头部建议 16 字节：`magic(2) + version(1) + serializeType(1) + msgType(1) + status(1) + requestId(8) + bodyLength(4)`——不足则补齐，保证定长便于 `getInt`/`getLong` 定位。
+1. 头部定长：`magic(2) + version(1) + serializeType(1) + msgType(1) + status(1) + requestId(8) + bodyLength(4)` 一共 **18 字节**；想压到 16 字节，就把 `version`/`serializeType`/`msgType` 塞进同一个 flag 字节。定长才能用 `getInt`/`getLong` 直接定位字段，也便于 `initialBytesToStrip` 一次性剥离。
 2. 解码链：`LengthFieldBasedFrameDecoder(maxFrameLength=1MB, 0, 4, 0, 0)` 拿到完整帧 → 自定义解码器读头部、校验魔数 → 按 `serializeType` 选反序列化器 → 交给业务 Handler。
 3. `maxFrameLength` 必须设置，否则恶意长度字段会让对端申请巨大缓冲区（内存放大攻击）。
 4. 扩展性：头部预留 `status`、`version` 支持灰度；序列化类型做成可插拔（Protobuf/Hessian2/JSON），新老版本靠 `version` 协商。

@@ -121,7 +121,7 @@ flowchart TD
 | 系统 | 一致性协议 | CAP 定位 | 分区少数派的行为 | 数据模型 |
 | --- | --- | --- | --- | --- |
 | Eureka 1.x | 无共识协议，节点间异步复制（replicateToPeers） | AP | 继续接受注册与查询，返回可能陈旧的数据 | 内存 `ConcurrentHashMap` |
-| ZooKeeper 3.4~3.8 | ZAB（类 Paxos） | CP | 少数派拒绝写；`getChildren` 可读旧值 | ZNode 树 |
+| ZooKeeper 3.4~3.8 | ZAB（类 Paxos） | CP | 少数派进不了 quorum：默认读写都不可用（显式开启只读模式后可读到旧值） | ZNode 树 |
 | Nacos 1.x | 临时实例 Distro（AP）；持久实例 Raft（CP） | AP + CP 可切换 | Distro 分区各自服务；Raft 少数派不可写 | 内存 + Derby/MySQL |
 | Nacos 2.x | 同上，客户端改 gRPC 长连接，服务端换 JRaft | AP + CP 可切换 | 同上 | 内存 + Derby/MySQL |
 | Consul 1.x | hashicorp/raft | CP | 少数派不可写；`?stale` 允许旧读 | KV + 服务目录 |
@@ -129,9 +129,9 @@ flowchart TD
 
 要能讲清"ZooKeeper 做注册中心在什么情况下会全站不可用"：
 
-1. ZK 集群 3 节点挂 2 个 → 剩下 1 个进不了 quorum，**写全挂**（服务注册失败），但**读仍可用**（`getChildren` 在 follower 本地返回）。Dubbo 的 `ZookeeperRegistry` 只依赖读路径（`getChildren` + watch），所以 ZK 挂掉多数派时**新的消费者仍能拿到已有列表，新的提供者注册不进来**。这就是为什么很多公司用 ZK 做注册中心仍能跑，但那不是因为它高可用，而是因为注册和发现两条路径的依赖强度不同。
+1. ZK 集群 3 节点挂 2 个 → 剩下 1 个进不了 quorum，**读写全挂**：follower 与 leader 失联后会进入 LOOKING，ZK 3.8 的 `Learner.shutdown()` 会把该 peer 的 `ZooKeeperServer` 置空并 `closeAllConnections()`，所以 `getChildren` 同样报 `ConnectionLoss`。"少数派还能读"只在**显式开启只读模式**时成立（服务端 `readonlymode.enabled=true` 且客户端 `canBeReadOnly=true`），且读到的是可能陈旧的数据。所以 ZK 失去多数派时，**新提供者注册不进来、新消费者也订阅不到列表**；存量消费者靠 `RegistryDirectory` 的内存列表与本地文件缓存继续调用。很多公司用 ZK 做注册中心仍能跑，不是因为 ZK 高可用，而是因为消费者有本地缓存。
 2. ZK 的 watch 是**一次性**的，触发后必须重新注册。Dubbo 的 `ZookeeperRegistry` 在收到 `None`/`NodeChildrenChanged` 事件后会重新 `getChildren` 并**重新 addWatch**，否则会永久失去推送。
-3. ZK session 超时（`sessionTimeout`，默认在 `minSessionTimeout = 2 * tickTime` 与 `maxSessionTimeout = 20 * tickTime` 之间协商，`tickTime` 默认 2000ms，即默认 4s ~ 40s，未配置时为 2 * tickTime ≈ 4s ~ 40s 区间内客户端建议值）会导致临时节点被删除，进而触发该实例的全部订阅者刷新，形成**惊群**。
+3. ZK session 超时会导致临时节点被删除，进而触发该实例的全部订阅者刷新，形成**惊群**。超时值由客户端建议、服务端夹紧：`minSessionTimeout` 默认 `2 * tickTime`，`maxSessionTimeout` 默认 `20 * tickTime`（`tickTime` 在 `zoo_sample.cfg` 里常配 2000ms，而 ZK 3.8 `QuorumPeerConfig` 的字段默认值是 3000ms；按 2000ms 算即 4s ~ 40s）。
 
 ### 2.3 Eureka 的自我保护：最容易被追问的机制
 
@@ -221,7 +221,7 @@ flowchart LR
 
 **1）本地缓存是必需品，不是优化。** 注册中心完全不可用时，消费者必须能靠本地快照继续调用。Dubbo 的 `RegistryDirectory` 在收到 `notify(urls)` 后，把实例列表转换并缓存在内存中；`RegistryProtocol` 在注册中心连不上时还会读取**本地文件缓存**（默认在 `~/.dubbo/dubbo-registry-{application}-{port}.cache`，由 `AbstractRegistry.saveProperties` 落盘，写文件通过 `atomicWrite` 保证原子性）。
 
-**2）空列表保护（空保护）是保命开关。** 如果注册中心故障返回空列表，消费者若直接把路由表置空，会导致全部调用失败。Dubbo 的 `RegistryDirectory#refreshInvoker` 里对空列表做保护：当推来的 `invokers` 为空时，**不覆盖原有列表**，同时如果 `notify` 是"空推"（所有 provider 都下线），会 `destroyAllInvokers` 并把 `invokers` 置空（此处行为受 `RegistryProtocol` 的空推逻辑控制）。经典坑：注册中心被误删/网络抖动导致一次空推送，消费者全量报 `No provider available`。治理手段是配置注册中心的多地址与权限控制，并在推送侧做校验。
+**2）空列表保护（空保护）是保命开关。** 如果注册中心故障返回空列表，消费者若直接把路由表置空，会导致全部调用失败。Dubbo 的 `RegistryDirectory#refreshInvoker` 区分两种情况：推来的是**普通空列表**时走空保护——用上次缓存的 `cachedInvokerUrls` 重建列表，不把路由表清空；推来的是注册中心合成的 `empty://` URL（表示该服务确实没有提供者）时才 `forbidden = true` 并 `destroyAllInvokers()` 清空列表。经典坑：注册中心被误删/网络抖动导致一次"真空推"，消费者全量报 `No provider available`。治理手段是配置注册中心的多地址与权限控制，并在推送侧做校验。
 
 **3）列表变更要"增量合并"而不是"全量替换"。** 全量替换会让正在处理的请求的路由表瞬间失效。Dubbo 的 `RegistryDirectory` 内部用 `UrlInvokerMap`（`volatile` 字段 + `synchronized` 写）维护 `methodInvokerMap`，并在 `destroy` 旧 Invoker 前先替换引用等旧请求跑完。
 
@@ -268,6 +268,8 @@ namespace（租户/环境隔离，如 prod / gray）
 
 把这条讲清楚的价值：面试官问"你们注册中心为什么不选 CP"，正确答案是"**服务实例列表天生是 AP 语义**——实例随时上下线，短暂的不一致由调用方的重试与熔断兜住；但配置和元数据需要 CP"。
 
+Nacos 还有一层与 Eureka 自我保护对应的机制：**服务级保护阈值** `protectThreshold`（0~1 的小数，默认 0 表示关闭）。该服务的健康实例占比低于阈值时，Nacos 会把**全部实例（含不健康）**推给消费者，避免剩下的极少数健康实例被流量瞬间打满；代价和 Eureka 自我保护一样——消费者会拿到一部分不可用地址，要靠客户端重试与熔断兜住。
+
 ### 5.3 心跳与健康检查参数
 
 Nacos 1.x 客户端心跳（`com.alibaba.nacos.client.naming.beat.BeatReactor`）：
@@ -281,7 +283,7 @@ Nacos 1.x 客户端心跳（`com.alibaba.nacos.client.naming.beat.BeatReactor`�
 
 Nacos 2.x 的架构变化（重要，容易被追问版本差异）：
 
-- 客户端与服务端改为**单条 gRPC 长连接**（`NamingGrpcClientProxy`），端口为**主端口 + 1000**：主端口 8848 → gRPC 端口 9848；主端口 8849 → gRPC 端口 9849。**部署时防火墙必须放通 9848/9849**，这是 2.x 上线最常见的故障（客户端一直重连，报 `Client not connected`）。
+- 客户端与服务端改为**单条 gRPC 长连接**（`NamingGrpcClientProxy`），端口按主端口偏移：**客户端 gRPC 端口 = 主端口 + 1000**（8848 → 9848），**服务端间 gRPC 端口 = 主端口 + 1001**（8848 → 9849）。**部署时防火墙必须放通 9848/9849**，这是 2.x 上线最常见的故障（客户端一直重连，报 `Client not connected`）。
 - 临时实例的"心跳"退化为连接保活 + 客户端轻量上报（`HealthCheckRequest`），实例下线会更快感知（连接断开即触发）。
 - 服务端一致性组件从自研的 `RaftCore` 换成 **JRaft（sofa-jraft）**，Nacos 2.x 的持久实例与配置走 JRaft。
 - 订阅推送从 1.x 的 UDP 推送（易丢包、需 `PushReceiver` 兜底）改为 gRPC 双向流推送。
@@ -390,7 +392,7 @@ sequenceDiagram
 
 **阶段二：集群层。** `FailoverClusterInvoker#doInvoke` 先 `list(invocation)` 拿到全部 `Invoker`，再经 `RouterChain` 过滤（`TagRouter`、`ConditionRouter`、`ScriptRouter`、`MeshRuleRouter`），最后 `select(loadbalance, invocation, invokers, selected)` 选出一个。失败后按 `retries` 重试并排除已失败的（`invoked` 集合 + `available` 计算）。
 
-**阶段三：Filter 链。** 客户端 Filter 默认顺序（`@Activate(group = CONSUMER)`，order 值决定先后）大致为：`ConsumerContextFilter → FutureFilter → MonitorFilter → TimeoutFilter → ExceptionFilter → ...`。`TimeoutFilter` 负责在**服务端**记录超时日志（客户端超时由 `DefaultFuture` 处理）。
+**阶段三：Filter 链。** 客户端 Filter（`@Activate(group = CONSUMER)`，order 值决定先后）大致为：`ConsumerContextFilter → FutureFilter → ...`；注意 `TimeoutFilter`、`ExceptionFilter` 只挂在**服务端**（`@Activate(group = PROVIDER)`），前者记录服务端处理超时的日志，后者把服务端异常转成 `RpcResult`（客户端超时由 `DefaultFuture` 处理）。
 
 **阶段四：编码。** Dubbo 协议头 16 字节：`magic(2B, 0xdabb) + flag(1B) + status(1B) + requestId(8B) + dataLength(4B)`。flag 的低 5 位是序列化 ID（hessian2 = 2，fastjson2 = 23，jdk = 3，kryo = 8，protostuff = 10 等）。**序列化 ID 不一致会导致服务端反序列化失败或报 `Unknown serialization`**，是跨版本升级的常见事故。
 
@@ -449,8 +451,8 @@ flowchart TD
 
 版本与注意事项：
 
-- JDK 9 起 `Serializable` 的 `serialVersionUID` 未显式声明时由编译器计算，任何字段增删都会变更，跨版本报 `InvalidClassException: local class incompatible`。JDK 17 起对 JDK 反序列化攻击的缓解更多依赖 `jdk.serialFilter` 全局配置。
-- **JDK 序列化在生产 RPC 中不应该使用**：体积大、性能差、有反序列化 RCE 历史。若必须用，JDK 9+ 可以设置 `-Djdk.serialFilter=com.example.**;!*` 做白名单。JDK 17 引入的 `ObjectInputFilter` 接口与 `ObjectInputFilter.Config.setSerialFilter` 是标准做法（JDK 9 就有 `jdk.serialFilter` 系统属性，JDK 17 起 `ObjectInputFilter` 由 `java.io` 包提供）。
+- `serialVersionUID` 未显式声明时由**序列化运行时**计算（`java.io.ObjectStreamClass#computeDefaultSUID`，JDK 8 与 JDK 17 行为一致，不是某个版本才有的变化），计算依据包含类名、修饰符、接口、字段与方法签名，所以字段或方法一增删就会变更，跨版本报 `InvalidClassException: local class incompatible`。对 JDK 反序列化攻击的缓解要靠 `jdk.serialFilter` 全局配置。
+- **JDK 序列化在生产 RPC 中不应该使用**：体积大、性能差、有反序列化 RCE 历史。若必须用，设置 `-Djdk.serialFilter=com.example.**;!*` 做白名单：`java.io.ObjectInputFilter`、`ObjectInputFilter.Config.setSerialFilter` 与 `jdk.serialFilter` 系统属性都是 **JDK 9 引入**的（JEP 290），JDK 8 没有这套接口，只能自己重写 `ObjectInputStream#resolveClass` 做类过滤。
 - Hessian2 是 Dubbo 2.x/3.x 默认。注意 Hessian 的历史漏洞（CVE-2020-... 系列的 Hessian 反序列化）与 Dubbo 的 `SerializeSecurityManager`（Dubbo 2.7.5+ 引入，配合 `dubbo.application.serialize-check-status` 与 `dubbo.application.check-serializable`）。Dubbo 3.x 里类名黑白名单通过 `SerializeSecurityManager` + `-Ddubbo.application.serialize-check-status=STRICT` 控制。
 - Protobuf 没有"序列化 ID"概念，靠**字段号**保证兼容：字段号不能改、不能复用；`reserved` 关键字用于废弃字段号。这正是它能做到前后兼容的原因，也是它要求先定 IDL 的原因。
 - Kryo 需要注册类（`kryo.register(...)`），未注册会写入类名（体积变大），且**默认允许实例化任意类**，安全问题需要 `kryo.setRegistrationRequired(true)`。
@@ -659,7 +661,7 @@ private OrderService orderService;
 3. 调用时对参数做哈希：`selectors = arguments`，默认只对第一个参数哈希（`hash(arguments, ...)`），可用 `hash.arguments` 指定参数下标、`hash.nodes` 指定虚拟节点数。
 4. `TreeMap.tailMap(hash)` 取顺时针第一个节点，为空则取 `firstKey`。
 
-生产坑：**参数只有一个时哈希效果最好**。如果第一个参数是枚举、随机数或 userId，热度会集中；如果第一个参数是 null，会退化为对后续参数哈希，需确认行为。更好的做法是显式配置 `hash.arguments=0` 并保证参数分布均匀。
+生产坑：**参数只有一个时哈希效果最好**。如果第一个参数是枚举、随机数或 userId，热度会集中；如果第一个参数是 null，`toKey` 拼进哈希 key 的是字符串 `"null"`，所有首参为 null 的请求都会落到同一个实例（不会自动改用后面的参数）。更好的做法是显式配置 `hash.arguments=0` 并保证参数分布均匀。
 
 ```mermaid
 flowchart TD
@@ -867,6 +869,7 @@ java.util.concurrent.RejectedExecutionException:
 1. **延迟注册**：Dubbo 提供 `dubbo.provider.delay`（XML 中 `<dubbo:provider delay="-1"/>`，默认无延迟；`delay=-1` 表示等 Spring 初始化完再暴露）。Spring Boot 场景下用 `ApplicationContext` 的 `ContextRefreshedEvent` 之后暴露更稳。
 2. **预热（warmup）**：Dubbo 的 `warmup` 参数（默认 `600000` ms = 10 分钟），配合 `Weight` 计算，新实例的权重在预热期内从 1 线性升到配置权重。公式在 `AbstractLoadBalance#getWeight`：`weight * (uptime / warmup)`，`uptime < warmup` 时生效。
 3. **JIT 预热与健康检查就绪**：readiness 探针要打**业务端点**，确认依赖（DB、Redis、下游 RPC）都通再放流量。
+4. **消费者侧的启动检查**：`check` 默认 `true`，消费者启动时会检查注册中心里有没有可用提供者，没有就抛 `IllegalStateException`（`Failed to check the status of the service ... No provider available ...`）导致应用起不来。发布顺序不可控（消费者先于提供者启动、或提供者同批发布）时应把它设为 `false`（`dubbo.consumer.check=false` 或 `@DubboReference(check = false)`），靠启动后的重试与健康检查恢复。
 
 **下线问题**：直接 `kill -9` 或先停进程都会导致"注册中心还没通知、消费者还在打"的窗口期。
 
@@ -876,6 +879,8 @@ java.util.concurrent.RejectedExecutionException:
 2. 等待一个"消费者感知周期"（Eureka 场景建议 >= 90s；Nacos 2.x gRPC 推送通常秒级，但也要留几秒）。
 3. 再**拒绝新请求**（`ShutdownHook` 中先关闭端口或设置开关），继续处理在途请求。
 4. 等待在途请求完成（`awaitTermination`，配合 Dubbo 的 `shutdown.timeout`/`DEFAULT_SHUTDOWN_TIMEOUT`，Dubbo 2.7+ 默认等待 10s，超时强制关闭），最后销毁线程池与连接。
+
+上面这几步不用自己写：Dubbo 的 QOS（默认端口 22222，前提是 `qos-enable` 没被关掉）提供了现成命令——`offline` 只做"从注册中心摘除"（`BaseOffline#doUnexport` 只调 `registry.unregister`，不拒绝新请求、也不返回 `RpcException`），处置完用 `online` 恢复，`ls` 查看该实例已注册的服务与 URL。常见做法是发布脚本里先 `offline`、等一个感知周期再发 SIGTERM。
 
 ```mermaid
 stateDiagram-v2
@@ -1005,8 +1010,9 @@ jstack <pid> | grep -c "DubboServerHandler"
 jstack <pid> | grep -A 20 "DubboServerHandler" | head -100
 
 # 2. 看 Netty 客户端连接数与写缓冲
-#    通过 Dubbo Metrics (Prometheus 端点) 或 Netty 的 Channel 统计
-curl -s http://127.0.0.1:20880/metrics | grep -i "dubbo_provider_requests"
+#    走 Dubbo Metrics 的 Prometheus 端点（dubbo.metrics.protocol=prometheus，端口由 dubbo.metrics.port 指定，默认 20888）
+#    注意 20880 是 Dubbo 协议端口（二进制协议），不能用 curl 取指标
+curl -s http://127.0.0.1:20888/metrics | grep -i "dubbo_provider_requests"
 
 # 3. 看 JVM 与 GC
 jstat -gcutil <pid> 1000 20
@@ -1082,6 +1088,7 @@ flowchart LR
 - **跨机房**：同机房优先的 `TagRouter`/集群路由成为必备；跨机房调用延迟从 0.5ms 涨到 10ms 量级，超时与重试参数要按机房重算。
 - **QPS 上到十万后**：序列化与网络成为主要开销，必须换 Protobuf/Triple；单连接成为瓶颈，需要 `connections` 调大或多连接复用策略。
 - **接口数上到几千**：接口级注册数据量爆炸（ZK 的 ZNode 数、Nacos 的订阅关系数），必须走应用级服务发现与元数据中心分离。
+- **应用级服务发现的落地**：Provider 侧用 `dubbo.application.register-mode` 控制注册粒度——`interface`（只注册接口级）、`instance`（只注册应用级）、`all`（双注册，迁移期用）。应用级注册只把"应用名 + 主机 + 端口 + 元数据"写进注册中心；接口 → 应用的映射（ServiceNameMapping）与接口元数据放在元数据中心（`MetadataReport`），消费者先取应用级实例列表，再换取该应用暴露的接口。代价是多一次元数据查询、强依赖元数据中心可用，且 Provider 与 Consumer 需要同时升到 Dubbo 3.x。
 - **团队上百人**：治理规则（路由、限流阈值）需要平台化，靠配置文件已经无法维护，必须接入统一的治理控制面（Dubbo Admin / Sentinel Dashboard / 自研平台）。
 
 ## 高频面试题
@@ -1097,7 +1104,7 @@ flowchart LR
 4. 能力覆盖差异：Nacos 一个组件覆盖注册 + 配置；ZK 做配置能力弱（无版本、无灰度、无监听语义）。
 5. 代价：Nacos 持久实例需要 MySQL（生产环境），引入额外组件；2.x 必须放通 9848/9849 端口。
 
-**追问**：那 ZK 做注册中心就一定要换掉吗？答：不必。如果只做 Dubbo 服务发现、消费者只依赖读路径（`getChildren` + watch），ZK 挂掉多数派时存量调用不受影响；真正的问题是"新实例无法注册"和"惊群"，可以用双注册中心（迁移期）或本地缓存 + 静态兜底地址缓解。换与不换取决于是否有必须解决的痛点，而不是组件是否"先进"。
+**追问**：那 ZK 做注册中心就一定要换掉吗？答：不必。如果只做 Dubbo 服务发现、消费者侧有本地缓存，ZK 挂掉多数派（此时 ZK 的读写都不可用）时存量调用不受影响；真正的问题是"新实例无法注册""新消费者拿不到地址"和"惊群"，可以用双注册中心（迁移期）或本地缓存 + 静态兜底地址缓解。换与不换取决于是否有必须解决的痛点，而不是组件是否"先进"。
 
 ### Q2. Nacos 的临时实例和持久实例有什么区别？底层协议一样吗？
 
@@ -1181,7 +1188,7 @@ flowchart LR
 1. 看现象分布：是"某个新实例报错多"还是"所有实例都慢"。前者是上线问题，后者是容量或依赖问题。
 2. 新实例的检查项：`jstack` 看线程是否在 Spring 初始化、类加载或 JDBC 首次连接；`jstat -gcutil` 看是否在频繁 Young GC；看 Dubbo 暴露时间与 Spring `ContextRefreshedEvent` 的先后。
 3. 修正配置：`dubbo.provider.delay=-1`（等 Spring 初始化完再暴露）或 `delay=5000`；`warmup` 调到 5~10 分钟；readiness 探针打 `/actuator/health/readiness` 并要求依赖全通。
-4. JIT 预热：可以配置预热流量（回放真实请求）或使用 `-XX:+TieredCompilation` 配合较高的 `-XX:TieredStopAtLevel`（生产不建议）来缩短首次峰值。
+4. JIT 预热：分层编译（`-XX:+TieredCompilation`，JDK 8 起默认开启，`TieredStopAtLevel` 默认 4）已经是先 C1 后 C2，想再缩短编译预热时间只能把它**调低**到 `-XX:TieredStopAtLevel=1`（只用 C1，峰值性能下降，生产不建议）；更可靠的做法是配置预热流量（回放真实请求）。
 5. 发布策略：金丝雀先放 1% 流量，观察 RT/错误率 5 分钟再全量；K8s 加 `preStop` 与 `terminationGracePeriodSeconds` 处理下线。
 
 **追问**：为什么新实例反而更容易超时？答：JIT 未编译（解释执行慢几倍到几十倍）、类没加载完（首次反射/序列化开销大）、连接池（DB/Redis/下游）还是空的（首次建连几百 ms）、CPU 缓存与分支预测未热。这些叠加起来，新实例首分钟 RT 可能是稳态的 3~10 倍。
@@ -1281,7 +1288,7 @@ flowchart LR
 | "注册中心挂了整个系统就挂了" | 消费者有本地缓存与空列表保护，注册中心短时不可用通常不影响存量调用 |
 | "实例越多负载越均衡" | 实例越多，注册中心推送成本与网络抖动风险越大；Dubbo 3.x 用应用级服务发现降低数据量 |
 | "线程池越大吞吐越高" | 线程数超过瓶颈资源（CPU、连接池、下游容量）后吞吐下降、延迟上升，需按瓶颈推导而非拍脑袋 |
-| "Nacos 2.x 只开放 8848 就够" | 2.x 还需要 9848/9849（主端口 + 1000）的 gRPC 端口，这是上线最常见的连通性问题 |
+| "Nacos 2.x 只开放 8848 就够" | 2.x 还需要 9848（主端口 + 1000，客户端 gRPC）与 9849（主端口 + 1001，服务端间 gRPC），这是上线最常见的连通性问题 |
 | "Eureka 自我保护是 bug" | 是刻意设计，防止注册中心自身抖动导致大批实例被误剔除；代价是死实例留存更久 |
 
 ## 一句话速记
@@ -1291,8 +1298,8 @@ flowchart LR
 - **注册中心职责**：注册、注销、健康检查、服务发现；四者 SLA 不同，发现路径要求极高可用。
 - **CAP 取舍**：实例列表是 AP 语义，配置与元数据是 CP 语义；Nacos 用临时/持久实例同时覆盖两者。
 - **Eureka**：心跳 30s、过期 90s、客户端拉取 30s、只读缓存刷新 30s、自我保护阈值 0.85，关掉只读缓存。
-- **ZooKeeper**：临时节点 + 一次性 watch，`tickTime` 默认 2000ms，session 超时导致临时节点被删并引发惊群。
-- **Nacos**：默认临时实例（Distro/AP）、持久实例（JRaft/CP）；1.x 心跳 5s/15s；2.x gRPC 端口 = 主端口 + 1000。
+- **ZooKeeper**：临时节点 + 一次性 watch，session 超时区间 = 2~20 倍 `tickTime`（`zoo_sample.cfg` 常用 2000ms，代码默认 3000ms），临时节点被删会引发惊群。
+- **Nacos**：默认临时实例（Distro/AP）、持久实例（JRaft/CP）；1.x 心跳 5s/15s；2.x gRPC 端口 = 主端口 + 1000（客户端）/ 主端口 + 1001（服务端间）。
 - **服务发现**：客户端发现（Dubbo/LoadBalancer）延迟低但要 SDK；服务端发现（K8s Service/Sidecar）多语言友好但少一层治理能力；两者都必须有本地缓存。
 - **RPC 五件事**：动态代理、方法契约、序列化、网络传输、请求响应关联。
 - **Dubbo 调用链**：Proxy → ClusterInvoker(Failover) → Directory → Router → LoadBalance → Filter → Codec → Netty → 服务端 Filter → Wrapper。

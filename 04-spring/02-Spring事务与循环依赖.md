@@ -47,7 +47,7 @@ Spring Boot 对应关系：Boot 2.0~2.7 用 Spring 5.0~5.3、JDK 8 起步；Boot
 
 1. `TransactionDefinition`：描述"事务长什么样"——传播行为、隔离级别、超时、是否只读、名称、标签。`DefaultTransactionDefinition` 的默认值是 `PROPAGATION_REQUIRED`、`ISOLATION_DEFAULT`、`TIMEOUT_DEFAULT`、`readOnly=false`。
 2. `PlatformTransactionManager`：只有三个方法 `getTransaction(TransactionDefinition)`、`commit(TransactionStatus)`、`rollback(TransactionStatus)`。真正的模板方法在 `AbstractPlatformTransactionManager`。
-3. `TransactionStatus`：一次事务的运行时句柄，能 `setRollbackOnly()`、`isNewTransaction()`、`hasSavepoint()`、`createAndHoldSavepoint()`。
+3. `TransactionStatus`：一次事务的运行时句柄，能 `setRollbackOnly()`、`isNewTransaction()`、`hasSavepoint()`、`createSavepoint()`（保存点三方法来自 `SavepointManager` 接口；`createAndHoldSavepoint()` 是 `AbstractTransactionStatus` 上的便捷方法）。
 
 ### 1.3 PlatformTransactionManager 类族
 
@@ -113,7 +113,7 @@ classDiagram
 - `TransactionSynchronizationManager.isSynchronizationActive()`：同步器机制已激活。注意二者不等价——`PROPAGATION_NOT_SUPPORTED` 会挂起事务并激活同步器，此时 synchronization 为 true 而 actual 为 false。**排查事务失效只需要打印这两个值**，比打任何断点都快。
 - `bindResource(Object key, Object value)` / `unbindResource(Object key)`：绑定、解绑连接。
 - `registerSynchronization(TransactionSynchronization sync)`：注册提交/回滚回调。
-- `getCurrentTransactionReadOnly()` / `getCurrentTransactionName()`：`AbstractRoutingDataSource#determineCurrentLookupKey` 里做读写分离路由的常用依据。
+- `isCurrentTransactionReadOnly()` / `getCurrentTransactionName()`：`AbstractRoutingDataSource#determineCurrentLookupKey` 里做读写分离路由的常用依据。注意只读标记只有布尔判定 `isCurrentTransactionReadOnly()`，没有 `getCurrentTransactionReadOnly()`；只有隔离级别才提供 `getCurrentTransactionIsolationLevel()`。
 
 `ConnectionHolder extends ResourceHolderSupport`，后者持有 `deadline`、`rollbackOnly`、`referenceCount` 三个关键状态：
 
@@ -199,7 +199,7 @@ Spring Boot 会顺手送一个 `TransactionTemplate` bean：`TransactionAutoConf
 
 | Bean 名 / 类型 | 作用 |
 | --- | --- |
-| `AnnotationTransactionAttributeSource` | 解析 `@Transactional`（`SpringTransactionAnnotationParser`）与 `jakarta.transaction.Transactional`（`JtaTransactionAnnotationParser`），内部用 `ConcurrentHashMap(1024)` 缓存属性 |
+| `AnnotationTransactionAttributeSource` | 解析 `@Transactional`（`SpringTransactionAnnotationParser`）与 JTA 注解 `Transactional`（`JtaTransactionAnnotationParser`，仅在 JTA 1.2 类存在时注册）：Spring 5.3 解析 `javax.transaction.Transactional`，Spring 6.0 起改为 `jakarta.transaction.Transactional`；属性缓存 `ConcurrentHashMap(1024)` 在父类 `AbstractFallbackTransactionAttributeSource` 里 |
 | `TransactionInterceptor` | 实现 `MethodInterceptor`，即 Advice |
 | `BeanFactoryTransactionAttributeSourceAdvisor` | `PointcutAdvisor`，把上面两个拼成一个切面，默认 `order = Ordered.LOWEST_PRECEDENCE` |
 
@@ -389,7 +389,7 @@ if (winner == null) { return super.rollbackOn(ex); }   // 无规则命中才回�
 return !(winner instanceof NoRollbackRuleAttribute);   // 命中 NoRollback 就不回滚
 ```
 
-因此：**同级时 `noRollbackFor` 胜出（因为 `NoRollbackRuleAttribute` 是最后判定）；但更具体的 `rollbackFor` 会压过更宽泛的 `noRollbackFor`**。例如 `noRollbackFor = Exception.class` 配 `rollbackFor = BizException.class`，抛 `BizException` 时深度为 0 的 `rollbackFor` 胜出，仍然回滚。业务里最稳的写法是：
+因此：**深度相同时先加入规则列表的 `rollbackFor` 胜出（`SpringTransactionAnnotationParser` 先加 `rollbackFor`、后加 `noRollbackFor`，而 `rollbackOn` 用严格的 `depth < deepest` 比较，并列时保留先遍历到的规则）；更具体的 `rollbackFor` 会压过更宽泛的 `noRollbackFor`**。例如 `noRollbackFor = Exception.class` 配 `rollbackFor = BizException.class`，抛 `BizException` 时深度为 0 的 `rollbackFor` 胜出，仍然回滚。业务里最稳的写法是：
 
 ```java
 @Transactional(rollbackFor = Exception.class)
@@ -505,7 +505,7 @@ flowchart TD
 | 3 | 异常被 catch 吞掉 | `completeTransactionAfterThrowing` 没被触发，正常走 commit | 重新抛；或 `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()` | 有 `UnexpectedRollbackException` 或数据没回滚 |
 | 4 | 异常类型不匹配 | 默认只回滚 `RuntimeException` 与 `Error` | `rollbackFor = Exception.class` | 日志里是 `IOException` 之类的 checked 异常 |
 | 5 | 多线程 / 线程池 / `@Async` | 6 个 `ThreadLocal` 不跨线程继承 | 在子线程内用 `TransactionTemplate` 自开事务；或事件 + `@TransactionalEventListener` | 子线程里 `isActualTransactionActive()` 为 false |
-| 6 | 数据库引擎不支持 | MyISAM、部分分区表、MongoDB 4.0 之前的多文档写 | 换 InnoDB；`SHOW ENGINES` / `information_schema.TABLES.ENGINE` 自查 | DDL 语句与写操作混在一个事务里（DDL 隐式提交） |
+| 6 | 数据库引擎不支持 | MyISAM、部分分区表、MongoDB 4.0 之前的多文档写 | 换 InnoDB | `SHOW ENGINES` 看 InnoDB 的 `Support` 是否为 `DEFAULT`；`SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE ENGINE<>'InnoDB'` |
 | 7 | 传播行为配置错误 | `NOT_SUPPORTED`/`NEVER` 挂起事务；`SUPPORTS` 在无事务上下文时不开 | 改回 `REQUIRED`；`MANDATORY` 只在明确链路中使用 | 观察 `isActualTransactionActive()` 与 `isSynchronizationActive()` 的组合 |
 | 8 | 类未被代理 | bean 由 `new` 创建、`final` 类、`final`/`static` 方法、早期引用暴露 | 交给容器管理；去掉 final；用 `@Lazy` 打破循环依赖 | 启动日志 `Could not generate CGLIB subclass of` 或 `... is not eligible for getting processed by all BeanPostProcessors` |
 
@@ -570,7 +570,7 @@ if (allowPublicMethodsOnly() && !Modifier.isPublic(method.getModifiers())) {
 补充两个易被忽略的失效原因（第 9、10 种，面试加分）：
 
 - **多数据源未指定 `transactionManager`**：`@Transactional` 默认按类型找唯一 `PlatformTransactionManager`，有两个以上时抛 `NoUniqueBeanDefinitionException`；配合 `@Primary` 或 `@Transactional(transactionManager = "orderTxManager")` 修正。
-- **响应式方法用错管理器**：方法返回 `Mono`/`Flux` 但注入的是 `DataSourceTransactionManager` 时，`TransactionAspectSupport#invokeWithinTransaction` 会走 `ReactiveAdapterRegistry` 分支并抛 `IllegalStateException: Cannot apply reactive transaction to non-reactive return type`。
+- **响应式方法用错管理器**：`TransactionAspectSupport#invokeWithinTransaction` 只在 `tm instanceof ReactiveTransactionManager` 时才走 `ReactiveAdapterRegistry` 分支；此时若方法返回值取不到 `ReactiveAdapter`（例如返回 `void`、普通对象），就抛 `IllegalStateException: Cannot apply reactive transaction to non-reactive return type [xxx] with specified transaction manager: ...`。反过来，方法返回 `Mono`/`Flux` 但管理器是 `DataSourceTransactionManager` **不会报错**——事务在方法返回（`Mono` 尚未被订阅）时就提交了，这是更隐蔽的坑。
 
 ## 六、事务与 AOP 的代理顺序：@Transactional 撞上 @Async
 
@@ -580,6 +580,7 @@ if (allowPublicMethodsOnly() && !Modifier.isPublic(method.getModifiers())) {
 2. `@EnableTransactionManagement(order = 0)` 才会显式设置；默认是 `LOWEST_PRECEDENCE`。
 3. `PostProcessorRegistrationDelegate#registerBeanPostProcessors` 的排序是：`PriorityOrdered` → `Ordered`（按 `getOrder()` 升序）→ 普通 BPP 按注册顺序。**`order` 越小越靠外层**。
 4. 代理是"一层一层叠"的：谁先包住 bean，谁的拦截器就在外层。`AbstractAdvisingBeanPostProcessor` 的 `beforeExistingAdvisors` 默认 `false`，因此当 bean 已经是代理时，它会把 advisor **追加到已有链的尾部（内层）**；只有这样追加，`AsyncAnnotationBeanPostProcessor` 与 `AnnotationAwareAspectJAutoProxyCreator` 才不会互相覆盖。
+5. **锁的范围永远小于事务的范围**：`@Transactional` 方法体内的 `synchronized` / `ReentrantLock` / 分布式锁在方法返回时就释放了，而事务要等拦截器 `commit` 才结束。并发下第二个线程会在第一个事务**提交前**拿到锁：读操作读到的是旧快照，写操作虽被行锁挡住，但基于旧快照做出的判断已经错了（"查了再插"的重复数据就是这么来的）。要么把锁上移到事务外层（调用方加锁），要么改用 `SELECT ... FOR UPDATE` 或乐观锁 + 唯一索引。
 
 ### 6.2 @Async 的装配链
 
@@ -642,7 +643,7 @@ public class OrderCreatedListener {
 
 ### 7.1 八个回调与触发顺序
 
-`TransactionSynchronization`（Spring 5.3）全部是 `default` 方法，共 8 个：
+`TransactionSynchronization`（Spring 5.3，接口还继承 `Ordered` 与 `Flushable`）的方法全部是 `default`：7 个回调 + `getOrder()` 共 8 个。
 
 | 回调 | 触发时机 | 典型用途 |
 | --- | --- | --- |
@@ -729,7 +730,7 @@ public class OrderService {
 
 三个必须知道的行为细节：
 
-1. `afterCommit` 抛出的异常会从 `triggerAfterCommit` 向外传播（默认 `errorHandler` 为空），此时**事务已经提交**，调用方却收到异常；`isRollbackOnCommitFailure` 默认 `false`，因此不会尝试回滚。所以 `afterCommit` 里必须自行 try-catch 兜底。
+1. `afterCommit` 抛出的异常会从 `triggerAfterCommit` 向外传播（`TransactionSynchronizationUtils#invokeAfterCommit` 不捕获异常；只有 `afterCompletion` 会被 catch 后打 error 日志），此时**事务已经提交**，调用方却收到异常；`isRollbackOnCommitFailure` 默认 `false`，因此不会尝试回滚。所以 `afterCommit` 里必须自行 try-catch 兜底。
 2. `afterCommit` 与 `afterCompletion` 执行时连接**仍绑定在当前线程**（`cleanupAfterCompletion` 在它们之后才跑）。此连接已经 `commit` 过且 `autoCommit=false`，在这里直接写库**不会被提交**，连接释放时静默丢失。要写库必须开新事务：`@Transactional(propagation = REQUIRES_NEW)`。
 3. `isSynchronizationActive()` 为 true 不代表真有事务。`@Transactional(propagation = NOT_SUPPORTED)` 下同步器是激活的（会触发回调），但 `isActualTransactionActive()` 为 false。判断"能不能注册事务回调"用前者，判断"是否在事务中"用后者。
 
@@ -874,7 +875,7 @@ sequenceDiagram
   TC-->>A: 全局事务完成
 ```
 
-关键表与字段（Seata 1.x）：`global_table`（`xid`、`status`、`application_id`）、`branch_table`（`branch_id`、`xid`、`resource_id`）、`lock_table`（`row_key`、`xid`、`table_name`）、业务库的 `undo_log`（`branch_id`、`xid`、`rollback_info`、`log_status`、`log_created`）。`@GlobalTransactional` 与 `@Transactional` 经常叠加使用：**`@GlobalTransactional` 管全局，TD 内部每个本地写仍走 `@Transactional`**。
+关键表与字段（Seata 1.x）：`global_table`（`xid`、`status`、`application_id`）、`branch_table`（`branch_id`、`xid`、`resource_id`）、`lock_table`（`row_key`、`xid`、`table_name`）、业务库的 `undo_log`（`branch_id`、`xid`、`rollback_info`、`log_status`、`log_created`）。`@GlobalTransactional` 与 `@Transactional` 经常叠加使用：**`@GlobalTransactional` 管全局，全局事务内部每个本地写仍走 `@Transactional`**。
 
 ### 9.4 三个必须能说出来的坑
 
@@ -895,7 +896,7 @@ sequenceDiagram
 | 注解监听 | `@EventListener` | 由 `EventListenerMethodProcessor` 解析 |
 | 事务监听 | `@TransactionalEventListener` | 由 `TransactionalEventListenerFactory` 解析，位于 `spring-tx` |
 
-`@EventListener` 的装配时机：`EventListenerMethodProcessor` 实现 `SmartInitializingSingleton`，在 `afterSingletonsInstantiated()` 阶段扫描所有 bean，用 `DefaultEventListenerFactory`（`getOrder()` 返回 `Ordered.LOWEST_PRECEDENCE - 50`）把带注解的方法包装成 `ApplicationListenerMethodAdapter` 注册进广播器。
+`@EventListener` 的装配时机：`EventListenerMethodProcessor` 实现 `SmartInitializingSingleton`，在 `afterSingletonsInstantiated()` 阶段扫描所有 bean，用 `DefaultEventListenerFactory`（`getOrder()` 返回 `Ordered.LOWEST_PRECEDENCE`，即 `Integer.MAX_VALUE`）把带注解的方法包装成 `ApplicationListenerMethodAdapter` 注册进广播器。工厂列表先按 `getOrder()` 升序排序再逐个 `supportsMethod`，`TransactionalEventListenerFactory` 的 `order = 50` 更小，所以先被询问——这正是 `@TransactionalEventListener` 能盖过 `@EventListener` 解析的原因。
 
 `SimpleApplicationEventMulticaster` 的两个关键默认值：
 
@@ -936,7 +937,7 @@ sequenceDiagram
 | 事务内发事件、监听器要读数据时，必须配 `@TransactionalEventListener(AFTER_COMMIT)` | 同步 `@EventListener` 在提交前执行，监听器用另一条连接读不到未提交数据 |
 | AFTER_COMMIT 回调里写库要 `REQUIRES_NEW` | 此时原连接已提交，直接写不会提交（见 7.3） |
 | 监听器要异步就加 `@Async`，不要改成线程池直接调 | `@Async` 与 `@TransactionalEventListener` 组合是官方支持路径 |
-| 需要顺序就在监听器上标 `@Order` | `ApplicationListenerMethodAdapter` 用 `AnnotationAwareOrderComparator` 排序 |
+| 需要顺序就在监听器上标 `@Order` | 广播器（`AbstractApplicationEventMulticaster`）用 `AnnotationAwareOrderComparator` 对监听器排序，`ApplicationListenerMethodAdapter#getOrder` 负责读出方法上的 `@Order` |
 | 事件对象尽量不可变、字段少 | 同步事件会在同一线程穿过多层监听器，大对象增加 GC 压力 |
 | 自定义广播器时 bean 名必须叫 `applicationEventMulticaster` | `AbstractApplicationContext#initApplicationEventMulticaster` 按此名查找 |
 
@@ -949,10 +950,10 @@ flowchart TD
   subgraph P1["阶段一 容器刷新前"]
     A1["ApplicationContextInitializer 仅 Boot"]
     A2["EnvironmentPostProcessor 仅 Boot"]
+  end
+  subgraph P2["阶段二 refresh 第 5 步 BeanFactory 后置处理与定义装配"]
     A3["BeanDefinitionRegistryPostProcessor"]
     A4["BeanFactoryPostProcessor"]
-  end
-  subgraph P2["阶段二 Bean 定义装配"]
     B1["ImportSelector 与 DeferredImportSelector"]
     B2["ImportBeanDefinitionRegistrar"]
   end
@@ -983,7 +984,7 @@ flowchart TD
 
 | 扩展点 | 触发时机 | 典型用途 | 注意事项 |
 | --- | --- | --- | --- |
-| `BeanDefinitionRegistryPostProcessor` | `refresh()` 第 5 步，最早 | 动态注册 bean，如 MyBatis `MapperScannerConfigurer` | 执行极早，不能依赖其他 bean |
+| `BeanDefinitionRegistryPostProcessor` | `refresh()` 第 5 步，最先执行的 BeanFactory 后置处理器 | 动态注册 bean，如 MyBatis `MapperScannerConfigurer` | 执行极早，不能依赖其他 bean；`ConfigurationClassPostProcessor` 自己就是 BDRPP，`@Import` 的 `ImportSelector` / `ImportBeanDefinitionRegistrar` 在它内部被解析 |
 | `BeanFactoryPostProcessor` | 第 5 步之后 | 修改已有 `BeanDefinition`，如 `PropertySourcesPlaceholderConfigurer` | 只能改定义，不能拿实例 |
 | `ImportSelector` / `DeferredImportSelector` | 配置类解析期 | 批量导入配置，Boot 自动配置用 `DeferredImportSelector` | `Deferred` 在用户配置全部处理完之后才执行，这是 `@ConditionalOnMissingBean` 能生效的前提 |
 | `ImportBeanDefinitionRegistrar` | 同上 | 编程式注册 bean，如 `AspectJAutoProxyRegistrar` | 与 `@Import` 搭配 |
@@ -1103,7 +1104,7 @@ flowchart TD
 | 策略 | `PlatformTransactionManager`、`InstantiationStrategy`、`ResourceLoader`、`HandlerMapping`、`CacheManager`、`BeanNameGenerator` | 通过类型注入 + `@Primary`/`@Qualifier` 在运行时切换 |
 | 观察者 | `ApplicationEvent`、`ApplicationListener`、`ApplicationEventMulticaster` | 事件与监听器完全解耦，支持泛型过滤与顺序 |
 | 工厂 | `BeanFactory`、`FactoryBean`、`ProxyFactory`、`SqlSessionFactoryBean` | `FactoryBean#getObject` 让复杂对象创建对容器透明 |
-| 代理 | `JdkDynamicAopProxy`、`CglibAopProxy`、`ProxyFactory`、`AbstractAutoProxyCreator` | 静态代理由 `Advised` 描述，动态代理运行期生成字节码 |
+| 代理 | `JdkDynamicAopProxy`、`CglibAopProxy`、`ProxyFactory`、`AbstractAutoProxyCreator` | 代理配置由 `Advised` 统一描述（target + advisor 链），实现分 JDK 动态代理与 CGLIB 运行期生成子类两种 |
 | 适配器 | `AdvisorAdapter`（`MethodBeforeAdviceAdapter`/`AfterReturningAdviceAdapter`/`ThrowsAdviceAdapter`）、`HandlerAdapter`（`RequestMappingHandlerAdapter`/`SimpleControllerHandlerAdapter`/`HttpRequestHandlerAdapter`）、`HandlerMethodArgumentResolver` | 把不同接口形态统一成容器可调用的固定入口 |
 | 责任链 | `MethodInterceptor` 链、`HandlerExecutionChain` + `HandlerInterceptor`、`Filter` 链 | 事务、缓存、异步、日志全部挂在同一条链上，顺序即语义 |
 | 装饰器 | `TransactionAwareCacheDecorator`、`ScopedProxyFactoryBean`、`LazyInitTargetSource` | 在不改原实现的前提下增强行为，缓存与事务的组合典范 |
@@ -1165,7 +1166,7 @@ flowchart LR
 | 看事务是否进入拦截 | `logging.level.org.springframework.transaction.interceptor=TRACE` | `Getting transaction for [com.x.OrderService.createOrder]`、`Completing transaction for [...]`、`No need to create transaction for [...]: This method is not transactional.`、`Skipping transactional joinpoint [...] because no transaction manager has been configured` |
 | 看连接获取与挂起 | `logging.level.org.springframework.jdbc.datasource.DataSourceTransactionManager=DEBUG` | `Acquired Connection [HikariProxyConnection@...] for JDBC transaction`、`Switching JDBC Connection [...] to manual commit`、`Initiating transaction commit`、`Suspending current transaction` |
 | 业务代码里判定 | `TransactionSynchronizationManager.isActualTransactionActive()` / `isSynchronizationActive()` | 最快的"是否真的在事务里"探针 |
-| 看当前事务属性 | `TransactionAspectSupport.currentTransactionStatus().isNewTransaction()` / `isRollbackOnly()` | 参与还是新建、是否已被标记回滚 |
+| 看当前事务属性 | `TransactionAspectSupport.currentTransactionStatus().isNewTransaction()` / `isRollbackOnly()` | 参与还是新建、是否已被标记回滚；**无事务时它直接抛 `NoTransactionException: No transaction aspect-managed TransactionStatus in scope`**，所以先判 `isActualTransactionActive()` 再取 `currentTransactionStatus()` |
 | 连接泄漏 | `spring.datasource.hikari.leak-detection-threshold=20000` | 超过 20 秒未归还打印 `Connection leak detection triggered for ...` 与堆栈 |
 | 连接池指标 | `spring.datasource.hikari.maximum-pool-size` 与 Actuator `/actuator/metrics/hikaricp.connections.active`、`hikaricp.connections.pending` | `pending` 持续大于 0 就是池不够 |
 | MySQL 长事务 | `SELECT trx_id, trx_state, trx_started, trx_mysql_thread_id, trx_query FROM information_schema.INNODB_TRX ORDER BY trx_started;` | 找出运行超过 1 秒的事务与其 SQL |
@@ -1177,7 +1178,7 @@ flowchart LR
 
 | 线上现象 | 高概率根因 | 定位路径 |
 | --- | --- | --- |
-| `UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only` | 内层 `REQUIRED` 抛异常被外层 catch | TRACE 日志找内层 `Completing transaction ... with rollback-only` 与 `Rolling back transaction` |
+| `UnexpectedRollbackException: Transaction silently rolled back because it has been marked as rollback-only` | 内层 `REQUIRED` 抛异常被外层 catch | TRACE 找内层方法的 `Getting transaction for [...]`；DEBUG 找内层 `Participating transaction failed - marking existing transaction as rollback-only` 与外层 `Global transaction is marked as rollback-only but transactional code requested commit` |
 | `Lock wait timeout exceeded; try restarting transaction`（MySQL 1205） | 长事务持锁、`innodb_lock_wait_timeout` 默认 50 秒被打满 | `INNODB_TRX` 找长事务，`data_lock_waits` 找等待关系 |
 | `Deadlock found when trying to get lock; try restarting transaction`（MySQL 1213） | 两事务加锁顺序相反 | `SHOW ENGINE INNODB STATUS` 的 `LATEST DETECTED DEADLOCK`，统一加锁顺序 |
 | `HikariPool-1 - Connection is not available, request timed out after 30000ms` | 连接泄漏、`REQUIRES_NEW` 翻倍占用、慢 SQL | 先看 `hikaricp.connections.active` 是否等于 `maximumPoolSize`，再看 `leak-detection-threshold` 输出 |
@@ -1204,7 +1205,7 @@ flowchart LR
 | `@Transactional` 传播 / 隔离 / 超时 / 只读 | `REQUIRED` / `DEFAULT(-1)` / `TIMEOUT_DEFAULT(-1)` / `false` | `DefaultTransactionDefinition` |
 | 默认回滚异常 | `RuntimeException`、`Error` | `DefaultTransactionAttribute#rollbackOn` |
 | 事务 advisor 顺序 | `Ordered.LOWEST_PRECEDENCE` | `AbstractPointcutAdvisor#getOrder` |
-| `allowCircularReferences`（FrameWork） | `true` | `AbstractAutowireCapableBeanFactory` |
+| `allowCircularReferences`（Framework） | `true` | `AbstractAutowireCapableBeanFactory` |
 | `spring.main.allow-circular-references`（Boot 2.6+） | `false` | `SpringApplication` |
 | `spring.aop.proxy-target-class`（Boot 2.x） | `true`（CGLIB） | `AopAutoConfiguration` |
 | `spring.lifecycle.timeout-per-shutdown-phase` | `30s` | `LifecycleProperties` |
@@ -1231,7 +1232,7 @@ flowchart LR
 固定四步：
 
 1. **确认事务有没有进拦截器**：TRACE 日志有没有 `Getting transaction for [...]`。没有 → 走 5.1 决策树查 8 种失效场景；有 → 进第 2 步。
-2. **确认异常与回滚规则**：日志里有没有 `Completing transaction for [...]` 与 `Rolling back transaction`。有 `Completing` 但没有 `Rolling back` → 回滚规则不匹配（场景 3、4）。
+2. **确认异常与回滚规则**：TRACE 日志里有没有 `Completing transaction for [...] after exception: xxx`，它后面紧跟的是 `Initiating transaction rollback` 还是 `Initiating transaction commit`（这两条在 DEBUG）。跟 `commit` → 回滚规则不匹配（场景 3、4）。
 3. **确认资源与并发**：`hikaricp.connections.active`、`INNODB_TRX`、`data_lock_waits`。连接池满或锁等待是"事务没失效但接口超时"的主因。
 4. **确认线程**：异步链路里打印 `isActualTransactionActive()`，区分"没有事务"与"另一个线程的事务"。
 
@@ -1290,15 +1291,15 @@ log.info("tx active={}, sync active={}, name={}, readOnly={}",
 3. 吞异常的修复是 `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()`，它会把 `ConnectionHolder` 置 `rollbackOnly`。
 4. `TransactionTemplate` 是例外：它对 `Throwable` 全部回滚，并包装成 `UndeclaredThrowableException`。
 
-**追问**：`rollbackFor = Exception.class` 与 `rollbackFor = RuntimeException.class` 同时写会怎样？答：按具体度匹配，抛 `BizException extends RuntimeException` 时两条规则深度分别是 0 与 1，`Exception` 那条深度为 0 胜出，仍然回滚。
+**追问**：`rollbackFor = Exception.class` 与 `rollbackFor = RuntimeException.class` 同时写会怎样？答：按"继承深度最小"匹配，抛 `BizException extends RuntimeException` 时 `RuntimeException` 那条深度是 1、`Exception` 那条深度是 2（`RollbackRuleAttribute#getDepth` 每上一层父类深度 +1），深度小的 `RuntimeException` 胜出，仍然回滚。
 
 ### Q4.（场景排查）线上接口偶发 `UnexpectedRollbackException`，但业务日志里没有任何异常堆栈，怎么定位？
 
-**答题框架（30 秒版）**：这是"内层事务被标记 rollback-only，外层提交被拒"的典型症状。定位三步：开 `TransactionInterceptor` TRACE 日志、搜 `Rolling back transaction` 与 `rollback-only`、定位被 catch 掉异常的那个内层方法。
+**答题框架（30 秒版）**：这是"内层事务被标记 rollback-only，外层提交被拒"的典型症状。定位三步：开 `TransactionInterceptor` TRACE 日志、搜 `rollback-only` 与 `after exception`、定位被 catch 掉异常的那个内层方法。
 
 **展开（2 分钟版）**：
 
-1. 打开 `logging.level.org.springframework.transaction.interceptor=TRACE`，日志会显示内层方法 `Completing transaction for [...]` 后跟 `with rollback-only`，外层显示 `Participating in existing transaction`。
+1. 打开 `logging.level.org.springframework.transaction.interceptor=TRACE` 与 `logging.level.org.springframework.transaction.support=DEBUG`：内层方法本身会显示 `Participating in existing transaction`，内层失败时打 `Participating transaction failed - marking existing transaction as rollback-only`，外层提交时打 `Global transaction is marked as rollback-only but transactional code requested commit`，随后抛 `UnexpectedRollbackException`。
 2. 常见根因：内层方法 `try/catch` 只打日志不抛；或内层 `@Transactional` 方法与外层不是同一事务管理器。
 3. 修复：内层异常重新抛出；或在内层 catch 里显式 `setRollbackOnly()`；或把内层改成 `REQUIRES_NEW` 让它独立成败。
 4. 不要用 `setGlobalRollbackOnParticipationFailure(false)` 掩盖，那会让数据真的写进去而不回滚。
@@ -1449,7 +1450,7 @@ log.info("tx active={}, sync active={}, name={}, readOnly={}",
 3. 自定义广播器时 bean 名必须是 `applicationEventMulticaster`，否则不生效。
 4. 监听器内部需要写库时用 `REQUIRES_NEW`，原因见 Q7。
 
-**追问**：监听器执行顺序可控吗？答：可以，`ApplicationListenerMethodAdapter` 用 `AnnotationAwareOrderComparator`，加 `@Order` 即可。
+**追问**：监听器执行顺序可控吗？答：可以，广播器（`AbstractApplicationEventMulticaster`）用 `AnnotationAwareOrderComparator` 排序，`ApplicationListenerMethodAdapter` 从方法上的 `@Order` 解析出序号，加 `@Order` 即可。
 
 ## 易错点与踩坑
 

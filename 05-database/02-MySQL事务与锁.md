@@ -123,7 +123,7 @@ stateDiagram-v2
 
 ### 2.3 隔离级别的查看与设置
 
-变量名在 MySQL 5.7.20 起从 `tx_isolation` 改为 `transaction_isolation`（`tx_isolation` 保留为废弃别名）。
+变量名在 MySQL 5.7.20 起从 `tx_isolation` 改为 `transaction_isolation`（旧名在 5.7 是废弃别名，8.0 已彻底移除）。
 
 ```sql
 -- 查看当前会话与全局隔离级别
@@ -267,7 +267,7 @@ sequenceDiagram
 | 不可重复读 | 存在 | 不存在 |
 | 间隙锁 | 一般不用（唯一键冲突检测、外键检查除外） | 广泛使用 |
 | 半一致性读 | 自动启用 | 不启用 |
-| binlog 兼容性 | 需 `binlog_format=ROW`（或在 5.6+ 用 `rc` 下也必须 ROW） | `STATEMENT` 也安全 |
+| binlog 兼容性 | 需 `binlog_format=ROW`（RC 下用 `STATEMENT`，主从执行时刻不同会读到不同快照） | `STATEMENT` 也安全 |
 
 `trx_assign_read_view` 在 `row_search_mvcc`（`storage/innobase/row/row0sel.cc`）中被调用，条件是 `prebuilt->select_lock_type == LOCK_NONE`，也就是"这次查询是快照读"。
 
@@ -290,16 +290,16 @@ MySQL 8.0 的语法变化：`SELECT ... LOCK IN SHARE MODE` 被 `SELECT ... FOR 
 
 `INSERT` 也被算作当前读，因为它要做唯一键冲突检测——发现重复键时会去读最新版本；同时插入前要在目标间隙上加插入意向锁。
 
-### 5.2 RR 下幻读的三种真实场景
+### 5.2 RR 下幻读的场景与判定
 
-结论先行：**在 InnoDB 的 RR 下，幻读在"纯快照读"路径上被消除；在"当前读"路径上被临键锁大部分消除；但混用、无索引、唯一键等场景下仍会出现。**
+结论先行：**在 InnoDB 的 RR 下，幻读在"纯快照读"路径上被消除；在"当前读"路径上被临键锁（记录锁 + 间隙锁）挡住；真正还会出现的只有"快照读与当前读混用"的场景。**
 
 | 场景 | 是否幻读 | 原因 |
 | --- | --- | --- |
 | 事务内全是快照读 | 不会 | 复用一个 Read View，新插入的行 `trx_id >= m_low_limit_id` 不可见 |
 | 事务内全是当前读（有索引的范围查询） | 一般不会 | 范围上加临键锁，其他事务的插入意向锁被挡住 |
 | 先快照读，另一事务插入并提交，再当前读 | **会** | 当前读读的是最新已提交版本，能看到新行。这是"同一事务内前后读结果不一致"的真实来源 |
-| `WHERE` 条件字段**没有索引** | **会**（且锁全表） | 全表扫描逐行加临键锁，锁范围覆盖全部间隙，但插入若不在扫描路径的间隙上仍可能成功；另外锁表本身是灾难 |
+| `WHERE` 条件字段**没有索引** | **不会**（但等效锁全表） | 全表扫描逐行加临键锁，最后一个间隙（到 supremum）也被锁住，其他事务插不进新行；代价是锁表本身是灾难 |
 | 唯一索引等值查询命中记录 | 不会（同一等值条件） | 临键锁退化为记录锁，不锁间隙；但插入**别的值**本来也不在该查询范围内 |
 | 唯一索引等值查询未命中记录 | 不会（同一等值条件） | 退化为间隙锁，插入该间隙被挡 |
 
@@ -419,7 +419,7 @@ WHERE OBJECT_SCHEMA = 'your_db' AND OBJECT_NAME = 't'\G
 | --- | --- | --- | --- |
 | 记录锁 Record Lock | `LOCK_REC_NOT_GAP` | 单条索引记录本身 | 唯一索引等值命中、`UPDATE ... WHERE pk = 1` |
 | 间隙锁 Gap Lock | `LOCK_GAP` | 两条索引记录之间的开区间 | 等值查询未命中、临键锁的间隙部分 |
-| 临键锁 Next-Key Lock | 记录锁 + 间隙锁的组合 | 左开右闭区间 `(a, b]` | RR 下范围查询的默认加锁单位 |
+| 临键锁 Next-Key Lock | `LOCK_ORDINARY`，即记录锁 + 间隙锁的组合 | 左开右闭区间 `(a, b]` | RR 下范围查询的默认加锁单位 |
 | 插入意向锁 Insert Intention Lock | `LOCK_INSERT_INTENTION` | 一种特殊的间隙锁，表示"即将在某间隙插入" | `INSERT` 之前 |
 
 要点：
@@ -428,6 +428,7 @@ WHERE OBJECT_SCHEMA = 'your_db' AND OBJECT_NAME = 't'\G
 2. **间隙锁之间不冲突**。两个事务可以在同一个间隙上加间隙锁，它们唯一的作用是阻止"插入意向锁"。所以间隙锁不会造成互相阻塞，但会造成"两个事务都持有间隙锁，然后都想插入"的死锁。
 3. **插入意向锁与间隙锁冲突**。一个事务持有 `(5, 10)` 的间隙锁时，另一个事务要插入 `id = 7` 就会先加插入意向锁，然后被挡住等待。
 4. **临键锁是"左开右闭"**。对 `c = 5` 加上临键锁，锁的是 `(0, 5]`，即"不许插入 1~4，也不许改 5"。
+5. **间隙不只在记录之间**。InnoDB 索引两端有 infimum 与 supremum 两个伪记录，`(最后一条记录, supremum)` 也是间隙锁的作用范围——`performance_schema.data_locks` 里看到 `LOCK_DATA = supremum` 就是锁到了索引末尾之外。这正是"无索引的全表扫描能挡住任意插入"的原因。
 
 ```mermaid
 flowchart LR
@@ -522,7 +523,7 @@ INSERT INTO t VALUES (0,0,0),(5,5,5),(10,10,10),(15,15,15),(20,20,20),(25,25,25)
 | `SELECT * FROM t WHERE c = 25 FOR UPDATE` | `(20, 25]` 临键锁 | `c = 25` 是最后一个值，无右侧不满足条件的记录，优化 2 不适用 |
 | `SELECT * FROM t WHERE id >= 10 AND id < 11 FOR UPDATE` | `id = 10` 记录锁 + `(10, 15]` 临键锁 | bug：范围查询访问到第一个不满足条件的 15 |
 | `SELECT * FROM t WHERE d = 5 FOR UPDATE` | 所有记录加临键锁，等效锁全表 | d 无索引，走全表扫描，原则 2 覆盖所有扫描到的记录 |
-| `UPDATE t SET c = c + 1 WHERE id = 10` | `id = 10` 记录锁 | 与 `FOR UPDATE` 同理，UPDATE 一定是当前读 |
+| `UPDATE t SET c = c + 1 WHERE id = 10` | `id = 10` 记录锁 + `idx_c` 上被删/新增索引记录的锁 | 与 `FOR UPDATE` 同理，UPDATE 一定是当前读；改的是索引列，还要额外维护二级索引 |
 
 关于最后一条"bug"的准确表述：**唯一索引上的范围查询会一直向右扫描到第一个不满足条件的记录为止，并对该记录也加临键锁**。所以 `id >= 10 AND id < 11` 会把 `(10, 15]` 也锁上，插 `id = 12` 会被阻塞——尽管 `12` 显然不满足 `id >= 10 AND id < 11`。这是 MySQL 5.7/8.0 均存在的既有行为，属于"范围边界确定"的实现代价而非缺陷修复对象。
 
@@ -576,7 +577,7 @@ try restarting transaction
 
 ### 9.2 死锁检测的代价与"检测风暴"
 
-死锁检测的算法是：每当一个事务需要等待锁，就遍历"等待图"判断加入这条边是否形成环。等待图规模为 n 时，单次检测接近 O(n²)。当活跃事务数达到几千、且每条语句都要等锁时，检测本身会把 CPU 打满。
+死锁检测的算法是：每当一个事务需要等待锁，就遍历"等待图"判断加入这条边是否形成环。等待图规模为 n 时，单次要遍历一次等待图（O(n) 量级）；但每个等锁的事务都要检测一次，活跃事务数达到几千、且每条语句都要等锁时，累计开销接近 O(n²)，检测本身会把 CPU 打满。
 
 **这就是"高并发下 MySQL CPU 100% 但 QPS 很低"的经典成因之一。** 官方给出的建议是：并发度很高时如果死锁不是主要问题，可以关闭死锁检测（`innodb_deadlock_detect = OFF`），让锁等待退化为超时（由 `innodb_lock_wait_timeout` 兜底），把 CPU 从检测中解放出来。代价是死锁不再被立即发现，只能等超时。配套要把 `innodb_lock_wait_timeout` 调小（例如 5 秒）。
 
@@ -683,6 +684,7 @@ RECORD LOCKS ... LOCK_MODE: X,REC_NOT_GAP
 | 间隙锁 + 插入意向锁 | `SELECT ... FOR UPDATE` 范围查询后又插入 | 精确化 WHERE 条件、加合适索引避免锁无关区间 |
 | RR 的临键锁放大 | 无索引 UPDATE 锁全表，与任意事务冲突 | 补索引；迁移到 RC |
 | 事务内两种资源顺序不一 | 先锁 A 表行再锁 B 表行，另一事务反之 | 统一跨表访问顺序；拆小事务 |
+| 外键的隐式共享锁 | 子表 `INSERT`/`UPDATE` 会对父表对应记录加 `S` 锁，父表的 `DELETE`/`UPDATE` 得等这些 `S` 锁释放，两个事务方向相反就成环 | 高并发链路去掉外键约束，改由应用保证引用完整性 |
 | 死锁检测缺失 | 主从切换、`ON DELETE CASCADE` 与外键混用 | 开启 `innodb_print_all_deadlocks`，定期分析 error log |
 
 ## 十、redo log、WAL 与两阶段提交
@@ -780,7 +782,7 @@ sequenceDiagram
 
 ### 10.4 组提交：把 fsync 攒起来
 
-**组提交（group commit）**解决的是"每次提交都要 fsync，fsync 是磁盘操作，TPS 上不去"的问题。机制是：把多个并发事务的日志攒成一批，一次 fsync 落盘，然后一起返回。
+<strong>组提交（group commit）</strong>解决的是"每次提交都要 fsync，fsync 是磁盘操作，TPS 上不去"的问题。机制是：把多个并发事务的日志攒成一批，一次 fsync 落盘，然后一起返回。
 
 binlog 侧的三个阶段各有优化：
 
@@ -830,7 +832,7 @@ flowchart TD
 
 ## 十二、长事务的危害与治理
 
-### 12.1 六条危害链
+### 12.1 七条危害链
 
 | 危害 | 机制 | 可观测指标 |
 | --- | --- | --- |
@@ -903,7 +905,7 @@ SHOW ENGINE INNODB STATUS\G   -- 查看 History list length 字段
 | `ALGORITHM` | 是否需要重建表 | MDL 写锁持有时间 | 8.0 支持范围 |
 | --- | --- | --- | --- |
 | `INSTANT` | 否，只改数据字典 | 极短（毫秒级） | 加列（8.0.12）、任意位置加列（8.0.29）、改默认值等 |
-| `INPLACE` | 否，原地修改（可能重建） | 全程持有，末尾短暂升级为排他 | 加索引、改列类型（部分） |
+| `INPLACE` | 可能重建（原地重建，不整表拷贝） | 支持并发 DML 的操作全程持有 `SHARED_UPGRADABLE`（不挡 DML），开始与末尾短暂升级为排他 | 加索引、改列类型（部分） |
 | `COPY` | 是，建临时表拷数据 | 全程持有，时长与数据量成正比 | 兜底方案，最慢 |
 | `DEFAULT` | 由 MySQL 自行选择 | 不确定 | 默认行为 |
 
@@ -940,19 +942,19 @@ SHOW ENGINE INNODB STATUS\G   -- 查看 History list length 字段
 - **死锁检测成本**随并发数平方增长，从 100 并发到 1000 并发，检测开销涨约 100 倍。
 - **Read View 数量**随长事务数量增长，活跃事务 5000 个时，`m_ids` 二分查找与 `changes_visible` 调用会显著拖慢查询。这也是要控制"同时活跃的写事务数"的原因。
 - **间隙锁范围**随数据页分裂而扩大。高频插入导致 B+ 树页分裂后，原本紧凑的区间变得稀疏，全表扫描型加锁的代价更大。
-- **表变大后 DDL 不可行**。1000 万行加索引即使 `INPLACE` 也要数分钟，MDL 写锁会阻塞业务，此时必须用 gh-ost 或 pt-online-schema-change。
+- **表变大后 DDL 代价剧增**。1000 万行加索引即使 `INPLACE` 也要数分钟：这期间 DML 不被阻塞，但会持续吃 IO/CPU、拉高主从延迟，首尾两次升级为排他 MDL 时还有短暂阻塞，所以生产上更稳的做法是 gh-ost 或 pt-online-schema-change。
 
 ## 高频面试题
 
 ### Q1. 事务的 ACID 分别是怎么实现的？
 
-**答题框架（30 秒版）**：原子性靠 undo log 回滚，持久性靠 redo log 的 WAL 与 `innodb_flush_log_at_trx_commit=fync`，隔离性靠 MVCC 加快照读、锁加当前读；**一致性没有独立机制**，是 A、I、D 加上主键/唯一索引/外键等约束共同保证的结果。
+**答题框架（30 秒版）**：原子性靠 undo log 回滚，持久性靠 redo log 的 WAL 与 `innodb_flush_log_at_trx_commit=1`（每次提交 fsync），隔离性靠 MVCC 加快照读、锁加当前读；**一致性没有独立机制**，是 A、I、D 加上主键/唯一索引/外键等约束共同保证的结果。
 
 **展开（2 分钟版）**：
 1. 原子性：`trx_undo_report_row_operation` 把旧值写进 undo log，回滚时逆操作；`insert undo log` 提交后即可删，`update undo log` 要给 MVCC 用。
 2. 持久性：WAL 先写日志再刷页，随机写变顺序写；`innodb_flush_log_at_trx_commit=1`（默认）时每次提交 fsync。
 3. 隔离性：快照读走 MVCC（`ReadView` + `DB_TRX_ID`/`DB_ROLL_PTR` 版本链），当前读走锁（记录锁/间隙锁/临键锁）。
-4. 一致性：`BEGIN` 前 `SET` 的约束、业务校验、跨系统的一致性由分布式事务或最终一致性方案解决。
+4. 一致性：没有独立机制，靠主键/唯一索引/外键/CHECK 等约束加业务校验保证；跨系统的一致性由分布式事务或最终一致性方案解决。
 
 **追问**：`innodb_flush_log_at_trx_commit=2` 什么时候能用？答：能接受"主机掉电丢 1 秒事务"但要求"MySQL 进程崩溃不丢"的场景，比如可重放的日志类写入；订单、支付不能用。
 
@@ -996,7 +998,7 @@ SHOW ENGINE INNODB STATUS\G   -- 查看 History list length 字段
 
 ### Q5. RR 下幻读到底解决了没有？
 
-**答题框架（30 秒版）**：分路径。纯快照读：解决了，因为复用一个 Read View，新插入行的 `trx_id >= m_low_limit_id` 不可见。当前读：靠临键锁挡住了范围内插入，但有几个真实漏洞——混用快照读与当前读、WHERE 无索引、以及"等值命中只加记录锁"时插入相邻值（但这不算该语句的幻影）。
+**答题框架（30 秒版）**：分路径。纯快照读：解决了，因为复用一个 Read View，新插入行的 `trx_id >= m_low_limit_id` 不可见。当前读：靠临键锁挡住了范围内插入；真正的漏洞是"快照读与当前读混用"（先快照读、别的事务插入提交后再当前读，就看到新行）。另外两点常被误答：`WHERE` 无索引时全表间隙都被锁住、插入根本进不来（不幻读，但等效锁表）；"等值命中只加记录锁"时插入相邻值不算该语句的幻影。
 
 **展开（2 分钟版）**：
 1. 快照读无幻读是 MVCC 的副产品，不是专门设计。
@@ -1049,7 +1051,7 @@ SHOW ENGINE INNODB STATUS\G   -- 查看 History list length 字段
 3. 处置：`KILL` 掉长事务让 DDL 完成，或者 `KILL` 掉 DDL 会话（注意 DDL 的 `KILL` 可能触发回滚，也要时间）。
 4. 预防：a) DDL 前 `SET SESSION lock_wait_timeout = 5`，让 DDL 快速失败而不是无限等待；b) 用 gh-ost / pt-online-schema-change 做影子表切换；c) MySQL 8.0 上用 `ALGORITHM=INSTANT`（加列在 8.0.12+、任意位置加列在 8.0.29+）；d) DDL 放业务低峰期并配合监控。
 
-**追问**：`ALGORITHM=INPLACE` 就不阻塞了吗？答：不是。`INPLACE` 仍然全程持有 MDL 写锁，只是不需要建临时表和拷数据。真正能极大缩短持锁时间的是 `INSTANT`。
+**追问**：`ALGORITHM=INPLACE` 就不阻塞了吗？答：不是。`INPLACE` 只是不用建临时表和整表拷贝：对支持并发 DML 的操作（加索引、加列），它全程持有的是可升级的 `SHARED_UPGRADABLE` 元数据锁，只在开始准备与末尾提交时短暂升级为排他，期间 DML 不被阻塞；不支持并发 DML 的 `INPLACE` 操作（如改列类型）才会全程挡住写入。真正把持锁时间压到毫秒级的是 `INSTANT`。
 
 ### Q10. 【场景设计】秒杀库存扣减，单行热点更新把数据库打死，怎么设计？
 
@@ -1094,11 +1096,11 @@ SHOW ENGINE INNODB STATUS\G   -- 查看 History list length 字段
 | 易错点 | 正确理解 |
 | --- | --- |
 | "一致性靠某种机制实现" | 一致性是结果，由 A、I、D 加约束共同保证，没有独立的"一致性日志" |
-| "RR 彻底解决了幻读" | 只在快照读路径彻底解决；当前读靠临键锁大部分解决；混用与无索引仍会幻读 |
+| "RR 彻底解决了幻读" | 只在快照读路径彻底解决；当前读靠临键锁挡住范围内插入；仍会幻读的只有"快照读与当前读混用" |
 | "间隙锁会互相阻塞" | 间隙锁之间不冲突，它们只阻塞插入意向锁 |
 | "行锁锁的是行数据" | 锁加在索引记录上。`WHERE` 无索引时全表扫描、等价锁全表 |
 | "MySQL 8.0 默认 RC" | MySQL 8.0 默认仍是 `REPEATABLE READ` |
-| "`tx_isolation` 是现在的变量名" | MySQL 5.7.20 起改为 `transaction_isolation`，旧名是废弃别名 |
+| "`tx_isolation` 是现在的变量名" | MySQL 5.7.20 起改为 `transaction_isolation`，`tx_isolation` 在 5.7 是废弃别名，8.0 已移除 |
 | "锁等待超时 50 秒也会作用于 DDL" | DDL 等的是 MDL，由 `lock_wait_timeout` 控制，默认 31536000 秒 |
 | "死锁会等 50 秒才报错" | 死锁由检测立即发现并回滚（报 1213）；50 秒是普通锁等待超时（报 1205） |
 | "`innodb_autoinc_lock_mode` 默认 1" | 5.7 默认 1，MySQL 8.0 默认 2（interleaved） |

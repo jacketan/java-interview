@@ -43,7 +43,7 @@ HotSpot（JDK 8 ~ JDK 21 的平台线程）采用 **1:1 线程模型**：一个 
 
 - `Thread#start0()` 是 `native` 方法，落到 `JVM_StartThread`，最终调用 `os::create_thread`，Linux 上走 `pthread_create`。
 - 线程栈大小由 `-Xss` 控制，HotSpot 在 Linux x64 上的 `ThreadStackSize` 默认为 **1024 KB**（1MB）。这意味着 1000 个线程约占用 1GB 虚拟地址空间（虚拟内存按需提交，但 `ulimit -s` 与物理提交仍受限）。
-- 线程数上限受三方面约束：`-Xss` 决定的虚拟内存、`ulimit -u`（`max user processes`）、`/proc/sys/kernel/threads-max`、以及 `vm.max_map_count`。
+- 线程数上限受四方面约束：`-Xss` 决定的虚拟内存、`ulimit -u`（`max user processes`）、`/proc/sys/kernel/threads-max`、以及 `vm.max_map_count`。
 - `java.lang.Thread` 中的 `threadStatus` 字段（`private volatile int`）保存 JVM 层线程状态，`Thread#getState()` 直接映射它；`start()` 首先校验 `threadStatus != 0`，不为 0 就抛 `IllegalThreadStateException`，这是"线程不能重启"的实现依据。
 
 JDK 19（JEP 425）引入**虚拟线程**预览，JDK 21（JEP 444）正式转正。虚拟线程是 **M:N 调度**：大量 `VirtualThread` 被调度到少量 `ForkJoinPool` 的载体线程（carrier thread）上。JDK 21 ~ JDK 23 中，虚拟线程在 `synchronized` 块里会 **pin** 住载体线程，直到 JDK 24（JEP 491）才移除该限制。这是"能不能把 `synchronized` 换成 `ReentrantLock`"这一追问的由来。
@@ -86,7 +86,7 @@ flowchart TD
 
 ### 2.1 六种状态的定义
 
-`Thread.State` 是 `java.lang.Thread` 的嵌套枚举，JDK 5 引入（在此之前用已废弃的 `Thread#isAlive`、`suspend` 等）。六个值：
+`Thread.State` 是 `java.lang.Thread` 的嵌套枚举，JDK 5 引入（在此之前没有统一的状态枚举，只能靠 `Thread#isAlive()` 与已废弃的 `suspend`/`resume` 推断）。六个值：
 
 | 状态 | 含义 | 进入方式 | 与 OS 线程状态的关系 |
 | --- | --- | --- | --- |
@@ -97,7 +97,7 @@ flowchart TD
 | `TIMED_WAITING` | 限期等待 | `Thread#sleep`、`Object#wait(long)`、`Thread#join(long)`、`LockSupport#parkNanos/parkUntil` | 内核态为定时睡眠 |
 | `TERMINATED` | 已终止 | `run()` 正常或异常返回 | 内核线程已退出 |
 
-**最容易答错的点**：`RUNNABLE` 包含了 IO 等待。一个阻塞在 `Socket#read` 上的线程，`jstack` 里显示 `java.lang.Thread.State: RUNNABLE`，栈顶是 `socketRead0`。原因是 HotSpot 没有为 IO 等待定义独立状态。面试里问"RUNNABLE 是不是一定在占 CPU"，答案是否定的。
+**最容易答错的点**：`RUNNABLE` 包含了 IO 等待。一个阻塞在 `Socket#read` 上的线程，`jstack` 里显示 `java.lang.Thread.State: RUNNABLE`，栈顶是 `socketRead0`（JDK 8/11；JDK 13 起 `Socket` 默认改用 `sun.nio.ch.NioSocketImpl`，无超时阻塞在 `sun.nio.ch.SocketDispatcher.read0`、设了 `setSoTimeout` 则阻塞在 `sun.nio.ch.Net.poll`，状态同样是 `RUNNABLE`）。原因是 HotSpot 没有为 IO 等待定义独立状态。面试里问"RUNNABLE 是不是一定在占 CPU"，答案是否定的。
 
 **第二个易错点**：`BLOCKED` 只表示 **等待 monitor（`synchronized`）**。等待 `ReentrantLock`（AQS）的线程状态是 `WAITING`，因为 AQS 用的是 `LockSupport.park()`。这是区分 `synchronized` 与 `ReentrantLock` 的一个具体观测点。
 
@@ -107,7 +107,6 @@ flowchart TD
 stateDiagram-v2
   [*] --> NEW : new Thread
   NEW --> RUNNABLE : start 检查通过
-  NEW --> TERMINATED : 不调用 start 直接丢弃
   RUNNABLE --> BLOCKED : 进入 synchronized 未抢到 monitor
   BLOCKED --> RUNNABLE : 抢到 monitor
   RUNNABLE --> WAITING : wait 无参 或 join 无参 或 park
@@ -120,7 +119,9 @@ stateDiagram-v2
   TERMINATED --> [*]
 ```
 
-注意 `WAITING --> BLOCKED` 这条边：`wait()` 被 `notify` 唤醒后，线程并不是直接回到 `RUNNABLE`，而是要先重新竞争 monitor，此时状态是 `BLOCKED`。因此 `wait` 与 `notify` 用的必须是**同一个锁对象**，否则唤醒后依然可能饥饿。
+未 `start()` 的线程会一直停在 `NEW`（只是被 GC 回收），**不存在 `NEW → TERMINATED` 的转换**，所以图上只有 `start()` 一条出路。
+
+注意 `WAITING --> BLOCKED` 这条边：`wait()` 被 `notify` 唤醒后，线程并不是直接回到 `RUNNABLE`，而是要先重新竞争 monitor，此时状态是 `BLOCKED`。也正因为唤醒依赖 wait set，`wait` 与 `notify` 必须作用在**同一个锁对象**上：`notify` 只唤醒该对象上等待的线程，用错对象信号就丢了，等待方可能永远醒不过来。
 
 ### 2.3 状态观测手段
 
@@ -216,24 +217,27 @@ public final synchronized void join(long millis) throws InterruptedException {
 
 ```mermaid
 flowchart TD
-  A["线程 T 调用 interrupt"] --> B{"目标处于 wait sleep join park?"}
+  A["线程 T 调用 interrupt"] --> B{"目标处于 wait sleep join?"}
   B -->|"是"| C["设置中断标志 并 唤醒目标"]
   C --> D["目标抛 InterruptedException"]
   D --> E["JVM 清除中断标志 恢复为 false"]
   E --> F["调用方必须决定是否重新 interrupt 自己"]
   B -->|"否"| G["仅设置中断标志 为 true"]
-  G --> H{"目标代码是否检查标志?"}
+  G --> P["若阻塞在 park 则立即返回 不抛异常"]
+  P --> H{"目标代码是否检查标志?"}
   H -->|"检查了"| I["主动退出或清理"]
   H -->|"没检查"| J["继续执行 中断被吞掉"]
   G --> K["若阻塞在 InterruptibleChannel 则抛 ClosedByInterruptException"]
   G --> L["若阻塞在 Selector.select 则立即返回"]
 ```
 
+`LockSupport#park` 是必须单独记住的特例：被 `interrupt` 后 `park` 会**立即返回，但不抛 `InterruptedException`，也不清除中断标志**，所以必须由代码自己判断（AQS 的 `parkAndCheckInterrupt` 就是先 `LockSupport.park(this)`，再 `return Thread.interrupted()`，由它负责清标志并抛异常）。另外 `park/unpark` 基于**许可（permit，最多累积 1 个）**，`unpark` 可以先于 `park` 调用而不丢信号——这一点比 `wait/notify` 宽松（`notify` 早于 `wait` 就是 lost wakeup）。
+
 **中断的三个盲区**（面试高频）：
 
 1. `synchronized` 等待 monitor 的线程**不可中断**，只能等锁。
 2. `ReentrantLock#lock()` 不可中断，必须用 `lockInterruptibly()`。
-3. 传统 `java.io` 的 `Socket#read`（阻塞在 `socketRead0`）**不响应中断**，只能用 `Socket#setSoTimeout(int)` 设读超时，或改用 NIO 的 `InterruptibleChannel`。
+3. 传统 `java.io` 的 `Socket#read`（JDK 8/11 上阻塞在 `socketRead0`；JDK 13+ 的 `NioSocketImpl` 下阻塞在 `SocketDispatcher.read0`）**不响应中断**，只能用 `Socket#setSoTimeout(int)` 设读超时，或改用 NIO 的 `InterruptibleChannel`。
 
 **被吞掉的中断**是线上事故常见根因，标准处理模板：
 
@@ -350,11 +354,11 @@ JMM 定义了 8 种作用于主内存与工作内存之间的原子操作（出�
 
 | 特性 | 定义 | 破坏它的原因 | Java 中的保障手段 |
 | --- | --- | --- | --- |
-| 原子性 | 一个或多个操作要么全部执行且不被中断，要么全不执行 | 线程切换；`i++` 这类 read-modify-write 被拆成多条字节码 | 基本类型的单次读写在 32 位平台外原子；`synchronized`、`Lock`、`AtomicInteger`（CAS） |
+| 原子性 | 一个或多个操作要么全部执行且不被中断，要么全不执行 | 线程切换；`i++` 这类 read-modify-write 被拆成多条字节码 | 除 `long`/`double` 外的基本类型与引用类型的单次读写原子（JLS 17.7）；`synchronized`、`Lock`、`AtomicInteger`（CAS） |
 | 可见性 | 一个线程修改变量后，其他线程能立即看到 | CPU 缓存 + Store Buffer 导致写入未及时刷主内存；编译器把变量放进寄存器 | `volatile`、`synchronized`、`Lock`、`final` |
 | 有序性 | 程序执行的顺序按代码先后进行 | 编译器重排序、指令级并行重排序、内存系统重排序 | `volatile`（禁止特定重排序）、`synchronized`、`happens-before` 规则 |
 
-**"哪些操作天然原子"**的准确表述：
+<strong>"哪些操作天然原子"</strong>的准确表述：
 
 - `int`、`char`、`short`、`byte`、`boolean`、`float`、引用类型的**单个读写**是原子的（JLS 17.7）。
 - `long` 与 `double` 的**非 volatile** 读写，JLS 明确允许拆成两次 32 位操作（32 位 JVM 上确实会发生"半个变量"的撕裂读）。HotSpot 在 64 位平台实现为原子，但**不能作为正确性依赖**；写了 `volatile` 就保证原子（JLS 17.7 规定 volatile long/double 读写原子）。
@@ -430,6 +434,8 @@ sequenceDiagram
 **可见性语义**：写 volatile 字段时，JMM 会把该线程工作内存中**所有共享变量**（不只是 volatile 字段本身）刷新到主内存；读 volatile 字段时，JMM 会把该线程工作内存置为无效，强制从主内存重新读取。所以 volatile 的真正威力在于它是一个"同步点"，会顺带把普通变量的写也发布出去（这正是第 5 节例子的机制）。
 
 **有序性语义**：禁止 volatile 字段与前后操作的特定重排序。
+
+**作用范围**：`volatile` 只作用于变量本身。`volatile int[] a` 只让 `a` 这个引用的读写具备 volatile 语义，`a[0]` 的读写没有任何额外保证；`volatile` 修饰对象引用也不会让对象内部字段获得可见性。需要元素级语义时用 `AtomicIntegerArray` 或 `VarHandle` 的数组访问模式。
 
 `volatile` **不提供**：原子性（复合操作）、互斥性、对临界区的保护。所以 `volatile int count` 配 `count++` 是错的。
 
@@ -604,7 +610,7 @@ flowchart TD
 | 懒汉式 `synchronized` 方法 | 是 | 是 | 否 | 否 | 每次调用都加锁，性能差 |
 | DCL + volatile | 是 | 是 | 否 | 否 | 经典，但写法容易漏 volatile |
 | 静态内部类 Holder | 是（`<clinit>` 由 JVM 加锁） | 是（首次调用才初始化 Holder） | 否 | 否 | **推荐**，无锁且延迟 |
-| 枚举 `enum` | 是 | 否（类加载即初始化） | 是（反射创建枚举抛 `IllegalArgumentException`） | 是（`readResolve` 由 JVM 保证） | 《Effective Java》推荐，最安全 |
+| 枚举 `enum` | 是 | 否（常量在类**初始化**时一次性创建，无法推迟到方法调用） | 是（反射创建枚举抛 `IllegalArgumentException`） | 是（`readResolve` 由 JVM 保证） | 《Effective Java》推荐，最安全 |
 | 容器式 `ConcurrentHashMap` | 是 | 是 | 否 | 否 | 适合多例管理 |
 
 静态内部类的原理：`Holder` 类只在首次访问 `Holder.INSTANCE` 时触发 `<clinit>`，类初始化由 JVM 保证线程安全（对应 JLS 12.4.2 的初始化锁 LC），且 happens-before 由类加载机制保证。这是"半个 JMM 规则"的实际应用。
@@ -682,7 +688,7 @@ double area = pi * r * r; // 3
 | 定义者 | Leslie Lamport，理论模型 | JSR 133 |
 | 单线程内 | 按程序顺序执行 | 允许重排序（只要 as-if-serial） |
 | 多线程间 | 所有操作存在一个全局全序，每个线程的操作在该全序中保持程序序 | 用 happens-before 偏序描述，不要求全局全序 |
-| 同步开销 | 无（理论上） | 只在同步点插入屏障，性能好 |
+| 同步开销 | 高：要求全局全序，实现上每次访存都要加屏障 | 只在同步点插入屏障，性能好 |
 | 结果 | 理论正确性基准 | 工程可实现，比 SC 弱但足够 |
 
 “正确同步的程序”——JMM 保证：**如果程序是正确同步的（即所有共享变量的访问都由 happens-before 关系串起来，不存在数据竞争），那么程序的执行结果与在顺序一致性模型下相同。** 这是 JMM 给开发者的核心承诺，也是"不要写数据竞争代码"这条规范的价值所在。
@@ -757,7 +763,7 @@ for i in 1 2 3; do jstack 12345 > /tmp/s$i.txt; sleep 5; done
 | `at com.xxx.Json.parse` 深度递归 | 大 JSON 解析 | 限流或改流式解析 |
 | GC 线程（`G1 Young RemSet Sampling`）占比高 | 不是业务线程，是 GC 频繁 | 看 GC 日志，查内存泄漏 |
 
-**GC 导致的 CPU 高如何区分**：看 `jstat -gcutil 12345 1000`，若 `FGCT`/`GCT` 持续增长且 `OU`（老年代使用率）接近 100%，则 CPU 消耗在 GC 上；若 GC 正常而 CPU 仍高，则是业务线程。
+**GC 导致的 CPU 高如何区分**：看 `jstat -gcutil 12345 1000`，若 `FGCT`/`GCT` 持续增长且 `O`（老年代使用率；`-gcutil` 的列名是 `O`，`OU` 是 `-gc` 的"老年代已用容量"）接近 100%，则 CPU 消耗在 GC 上；若 GC 正常而 CPU 仍高，则是业务线程。
 
 ### 10.2 线程死锁与卡死排查
 
@@ -785,7 +791,7 @@ Found one Java-level deadlock:
 
 ```bash
 jstack 12345 | grep -c '^"'                         # 线程总数
-jstack 12345 | grep '^"' | awk '{print $2}' | sort | uniq -c | sort -rn  # 按线程名分组 TOP
+jstack 12345 | grep '^"' | awk '{print $1}' | sort | uniq -c | sort -rn  # 按线程名分组 TOP（$1 才是 "线程名"，$2 是 #编号）
 jcmd 12345 Thread.print | grep -c "pool-"           # 线程池线程数
 cat /proc/12345/status | grep Threads               # 内核视角线程数
 ```
@@ -796,7 +802,7 @@ cat /proc/12345/status | grep Threads               # 内核视角线程数
 | --- | --- | --- |
 | `pool-1-thread-N` 的 N 持续增长 | 用了 `Executors.newCachedThreadPool()`，上游无超时导致任务堆积 | 换 `newFixedThreadPool` 或 `ThreadPoolExecutor` 显式指定 `maximumPoolSize` 与队列 |
 | `http-nio-8080-exec-N` 上千 | Tomcat 线程池被慢下游拖死 | 加下游超时 + 熔断 |
-| 线程数缓慢上涨永不回落 | `ThreadLocal` 未 `remove`，或定时任务 `scheduleAtFixedRate` 里起线程 | 定位 `ThreadFactory` 加线程名前缀，配合 `-XX:+PrintThreadsOnExit` |
+| 线程数缓慢上涨永不回落 | `ThreadLocal` 未 `remove`，或定时任务 `scheduleAtFixedRate` 里起线程 | 定位 `ThreadFactory` 加线程名前缀，再定时采样 `jcmd <pid> Thread.print` 统计线程数看增长 |
 | `Finalizer` 线程堆积 | 对象重写了 `finalize()` 且 `finalize` 阻塞 | 移除 `finalize`，改 `Cleaner`（JDK 9+） |
 
 ### 10.4 用 JOL 与压测验证内存布局
@@ -830,13 +836,13 @@ System.out.println(ClassLayout.parseClass(Counter.class).toPrintable());
 - CPU 高：`top -Hp` → `printf %x` → `jstack | grep nid`，三次采样看复现栈顶；同时 `jstat -gcutil` 排除 GC 因素。
 - 卡死/不响应：`jstack -l` 看死锁检测段、看线程是否全部 `park`、看是否有 `Object.wait` 无人 `notify`。
 - 偶发数据错乱：先确认 ARM/x86 差异，再审查共享字段的同步方式，用 `-XX:+PrintAssembly` 验证屏障存在。
-- 线程泄漏：`jstack | grep '^"' | awk '{print $2}' | sort | uniq -c | sort -rn` 找增长最快的线程名前缀，反查创建点。
+- 线程泄漏：`jstack | grep '^"' | awk '{print $1}' | sort | uniq -c | sort -rn`（`$1` 是线程名，`$2` 只是 `#编号`）找增长最快的线程名前缀，反查创建点。
 
 **问题三：规模变大后会怎样？**
 
 - 线程数从几百涨到几千：`-Xss` 1MB 默认值导致虚拟内存爆掉，`Thread` 对象本身也占堆；切换成本线性上涨；应转向虚拟线程或异步模型。JDK 21 的虚拟线程在 `synchronized` 中会 pin，需要用 `ReentrantLock` 替代。
 - 竞争从无到有：单线程无竞争时偏向锁几乎零成本（JDK 8 中 `-XX:BiasedLockingStartupDelay` 默认 4000ms 后开启）；一旦出现两个线程交替访问，偏向锁撤销与 `synchronized` 升级到轻量级锁、重量级锁会带来毛刺。注意 **JDK 15 起 JEP 374 把偏向锁标记为废弃并默认禁用**，JDK 18 起 `-XX:+UseBiasedLocking` 已不再生效，所以这句话只对 JDK 8~14 成立。
-- 计数器从 `AtomicLong` 到 `LongAdder`：CAS 竞争随核数上升急剧恶化，`LongAdder` 的 `Cell` 数量最多等于 CPU 核数（`Striped64` 中 `NCPU`），核数越多分片越多。
+- 计数器从 `AtomicLong` 到 `LongAdder`：CAS 竞争随核数上升急剧恶化，`LongAdder` 的 `Cell` 数量上限由 `Striped64` 的 `NCPU` 决定（不小于 `NCPU` 的最小 2 的幂），核数越多分片越多。
 - 伪共享在核数少时无感，在 32 核以上会显著放大，`@Contended` 的内存开销（每字段 128 字节）也开始需要权衡。
 
 ## 高频面试题
@@ -863,11 +869,11 @@ System.out.println(ClassLayout.parseClass(Counter.class).toPrintable());
 
 ### Q3. `interrupt` 是怎么停线程的？哪些情况停不下来？
 
-**答题框架（30 秒版）**：`interrupt` 不改线程状态，只设置中断标志。目标在 `wait/sleep/join/park` 时会被唤醒并抛 `InterruptedException`，同时 JVM 清除标志；否则目标必须自己检查 `isInterrupted()`。停不下来的三种情况：等 `synchronized` 锁、`ReentrantLock#lock()`、传统 `java.io` 的 `Socket#read`。
+**答题框架（30 秒版）**：`interrupt` 不强制终止线程，只设置中断标志。目标在 `wait/sleep/join` 时会被唤醒并抛 `InterruptedException`，同时 JVM 清除标志；阻塞在 `LockSupport#park` 时只是立即返回，不抛异常也不清标志，要自己检查 `Thread.interrupted()`；其余情况目标必须自己检查 `isInterrupted()`。停不下来的三种情况：等 `synchronized` 锁、`ReentrantLock#lock()`、传统 `java.io` 的 `Socket#read`。
 
 **展开（2 分钟版）**：补充 `interrupted()` 与 `isInterrupted()` 的区别（前者清除标志）；补充捕获 `InterruptedException` 后必须 `Thread.currentThread().interrupt()` 恢复标志，否则线程池 `shutdownNow()` 失效。
 
-**追问**：`interrupt()` 与 `stop()` 的区别？答：`Thread#stop()` 在 JDK 1.2 起被废弃（`@Deprecated`，JDK 9 起 `forRemoval = true`），它会释放线程持有的所有 monitor 并以 `ThreadDeath` 异常终止，导致对象处于不一致状态。JDK 20 起 `Thread#stop`、`suspend`、`resume` 已从规范中移除，调用直接抛 `UnsupportedOperationException`。
+**追问**：`interrupt()` 与 `stop()` 的区别？答：`Thread#stop()` 从 JDK 1.2 起就被废弃（JDK 11/17 源码里是 `@Deprecated(since="1.2")`；JDK 17 只有 `suspend`/`resume` 额外标了 `forRemoval = true`，`stop` 没有），它会释放线程持有的所有 monitor 并以 `ThreadDeath` 异常终止，导致对象处于不一致状态。JDK 20 起 `Thread#stop`、`suspend`、`resume` 调用直接抛 `UnsupportedOperationException`。
 
 ### Q4. 守护线程是什么？线程池创建的线程是守护线程吗？
 
@@ -891,7 +897,7 @@ System.out.println(ClassLayout.parseClass(Counter.class).toPrintable());
 
 **展开（2 分钟版）**：逐条举例，重点讲第 3 条容易被答错的地方——volatile 的 HB 关系只在"写 HB 后续读同一个字段"之间成立，如果对方根本不读，就没有保证。
 
-**追问**：两个线程都写同一个 volatile 字段，谁赢？答：JMM 不定义竞争写的顺序，只保证 `volatile` 写不会被重排序到 `StoreStore` 之前、不会与后续读重排序。最后写出的值取决于执行时序，属于未定义行为，不应依赖。
+**追问**：两个线程都写同一个 volatile 字段，谁赢？答：JMM 把所有 volatile 访问排进一个全局的同步顺序（synchronization order），各线程看到的顺序一致，但哪次写"最后生效"由执行时序决定，属于数据竞争，不应依赖；能确定的是每次读一定看到某一次完整的写，不会读到撕裂值。
 
 ### Q7. volatile 的底层实现是什么？为什么它在 x86 上很便宜？
 
@@ -907,7 +913,7 @@ System.out.println(ClassLayout.parseClass(Counter.class).toPrintable());
 
 **展开（2 分钟版）**：给出对照方案表（`synchronized`、`AtomicInteger`、`LongAdder`），说明 `AtomicInteger` 用 `Unsafe#compareAndSwapInt` 自旋，`LongAdder` 用 `Striped64` 分片减少 CAS 竞争，并指出 `LongAdder#sum()` 是弱一致的。
 
-**追问**：`LongAdder` 的 `Cell` 数组最大长度？答：`Striped64` 中 `NCPU` = `Runtime.getRuntime().availableProcessors()`，`Cell` 数组长度上限为最接近且不大于 `NCPU` 的 2 的幂（`tableSizeFor` 逻辑），所以核数越多分片越多。JDK 8 引入。
+**追问**：`LongAdder` 的 `Cell` 数组最大长度？答：`Striped64` 中 `NCPU` = `Runtime.getRuntime().availableProcessors()`；`cells` 初始长度为 2，只有 `n < NCPU` 时才按 2 倍扩容（`Striped64#longAccumulate` 里 `n >= NCPU` 就停止扩容），所以上限是**不小于 `NCPU` 的最小 2 的幂**（`NCPU` 本身是 2 的幂时就等于 `NCPU`），核数越多分片越多。JDK 8 引入。
 
 ### Q9. DCL 单例为什么要加 volatile？不加会出现什么现象？
 
@@ -987,7 +993,7 @@ public final class Config {               // 不可变
    这就是重复扣款的经典写法。两个线程同时通过 `contains` 检查，各自扣款。
 2. **换用 `jol` 检查字段布局**，确认是否有伪共享导致的异常（一般不会引发正确性问题，但要排除）。
 3. **开启汇编验证屏障**：`-XX:+UnlockDiagnosticVMOptions -XX:+PrintAssembly`，在 ARM 上确认 `volatile` 字段访问编译出 `ldar`/`stlr` 或 `dmb ish`。
-4. **构造 ARM 复现**：在 `aarch64` 环境用压力工具并发跑，或加 `-XX:-UseCompressedOops` 等改变编译行为的参数放大窗口。
+4. **构造 ARM 复现**：在 `aarch64` 环境用压力工具并发跑，或加 `-XX:-UseCompressedOops` 这类改变对象布局的参数改变时序窗口。
 5. **加可观测性**：在关键路径打 MDC 追踪 ID + 线程名，事后能重建交错时序。
 
 修复方案（按优先级）：
@@ -1005,7 +1011,7 @@ public final class Config {               // 不可变
 
 **追问二**：如果生产环境也是 x86，怎么排查？答：可见性 bug 在 x86 也可能出现（只是窗口小很多），可用 `-XX:+StressLCM`/`-XX:+StressGCM`（需要 debug 版 JVM）放大重排序窗口，或用 `jcstress`（OpenJDK 官方并发测试工具）编写最小化测试复现。另外还可考虑 JIT 相关的偶发性，用 `-Xint`（解释执行，无 JIT 重排序）与默认模式对比——如果 `-Xint` 下不复现，基本锁定重排序问题。
 
-### Q13. 【场景设计】一个高频调用的计数器，QPS 20 万，QPS 峰值 32 核机器。用 `AtomicLong` 发现 CPU 花在 CAS 自旋上，怎么优化？
+### Q13. 【场景设计】一个高频调用的计数器，峰值 QPS 20 万，跑在 32 核机器上。用 `AtomicLong` 发现 CPU 花在 CAS 自旋上，怎么优化？
 
 **考察点**：`LongAdder` 原理 + 伪共享 + 取舍。
 
@@ -1019,7 +1025,7 @@ public final class Config {               // 不可变
 | 写 | 所有线程 CAS 同一个地址，竞争剧烈时大量失败重试 | 先 CAS `base`，失败则哈希到某个 `Cell` CAS，失败再扩容或重哈希 |
 | 读 `sum()` | `get()` 精确值 | 遍历 `base` + 所有 `Cell`，**弱一致**（遍历期间可能有并发写） |
 | 高并发写吞吐 | 随核数上升急剧下降 | 随核数上升基本线性 |
-| 内存 | 8 字节（+ 对象头） | `base` + 最多 NCPU 个 `Cell`，每个约 128+ 字节 |
+| 内存 | 8 字节（+ 对象头） | `base` + 至多约 `NCPU` 个 `Cell`（长度为 2 的幂），每个约 128+ 字节 |
 | 适用 | 需要精确读、写竞争低 | 写多读少、能接受最终一致 |
 | 引入版本 | JDK 5 | JDK 8 |
 
@@ -1033,13 +1039,13 @@ public final class Config {               // 不可变
 
 | 易错点 | 正确理解 |
 | --- | --- |
-| `RUNNABLE` 就是正在占 CPU | `RUNNABLE` 还包含阻塞在 IO 上的线程，`jstack` 里 `socketRead0` 就是 `RUNNABLE` |
+| `RUNNABLE` 就是正在占 CPU | `RUNNABLE` 还包含阻塞在 IO 上的线程，JDK 8/11 的 `jstack` 里 `socketRead0` 就是 `RUNNABLE` |
 | 等 `ReentrantLock` 的线程是 `BLOCKED` | 是 `WAITING (parking)`，因为走的是 `LockSupport#park`；`BLOCKED` 专指等 monitor |
 | `sleep` 会释放锁 | 不释放。只有 `wait`、`park`（不带锁语义）、`Condition#await` 会释放对应锁 |
 | 用 `if` 而不是 `while` 包 `wait` | 必须 `while`，防虚假唤醒与 `notifyAll` 后的条件失效 |
 | `wait` 和 `notify` 用不同对象 | 必须同一个 monitor，否则 `IllegalMonitorStateException` 或唤醒后饥饿 |
 | `catch (InterruptedException e) {}` 空实现 | 必须恢复中断标志 `Thread.currentThread().interrupt()` 或向上抛 |
-| `Thread#stop()` 可以停线程 | JDK 1.2 起废弃，JDK 20 起移除（`UnsupportedOperationException`）；破坏对象一致性 |
+| `Thread#stop()` 可以停线程 | JDK 1.2 起废弃，JDK 20 起调用直接抛 `UnsupportedOperationException`（方法仍在，但已无效果）；破坏对象一致性 |
 | 认为 `interrupt` 能停住所有线程 | 等 `synchronized`、`ReentrantLock#lock()`、传统 `Socket#read` 都不可中断 |
 | `volatile` 保证 `i++` 安全 | 不保证。`volatile` 只有可见性与有序性，无原子性 |
 | `volatile` 只在 x86 上测过就没问题 | x86 是 TSO，弱内存模型问题被掩盖；ARM 上会暴露 |

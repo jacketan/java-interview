@@ -33,7 +33,7 @@ AQS 的源码在不同 JDK 里**长得不一样**，面试时如果说错版本�
 | JDK 7 (2011) | `FutureTask` 脱离 AQS | JDK 6 的 `FutureTask` 继承 AQS，JDK 7 起改为自实现的 `state` + `WaitNode` Treiber 栈，避免为一次性等待付出队列成本 |
 | JDK 8 (2014) | `StampedLock`、`LongAdder`、`CompletableFuture` | `StampedLock` 引入乐观读；`ReentrantReadWriteLock` 的 `HoldCounter`/`cachedHoldCounter` 优化成型 |
 | JDK 9 (2017) | `Unsafe` 内部化，`VarHandle` 登场 | AQS 里的 `sun.misc.Unsafe` 换成 `jdk.internal.misc.Unsafe`，JDK 11 起字段 CAS 改用 `java.lang.invoke.VarHandle`（`STATE`/`HEAD`/`TAIL`）；`Node` 结构不变 |
-| JDK 17 (2021) | **AQS 被重写** | `Node` 字段由 `waitStatus`/`thread`/`nextWaiter` 变为 `prev`/`next`/`waiter`/`status`，并引入抽象基类 `Node` 与子类 `ExclusiveNode`/`SharedNode`/`ConditionNode`；常量变为 `WAITING=1`、`CANCELLED=Integer.MIN_VALUE`、`COND=2`；模板方法被收敛进私有 `acquire(Node, int, boolean, boolean, boolean, long)`。JEP 396 同时强封装 JDK 内部 API，反射改 `state` 必须加 `--add-opens java.base/java.util.concurrent.locks=ALL-UNNAMED` |
+| JDK 17 (2021) | **AQS 被重写** | `Node` 字段由 `waitStatus`/`thread`/`nextWaiter` 变为 `prev`/`next`/`waiter`/`status`，并引入抽象基类 `Node` 与子类 `ExclusiveNode`/`SharedNode`/`ConditionNode`；常量变为 `WAITING=1`、`CANCELLED=Integer.MIN_VALUE`、`COND=2`；模板方法被收敛进包级方法 `acquire(Node, int, boolean, boolean, boolean, long)`（无访问修饰符，`javap` 可见）。同时强封装 JDK 内部 API，反射改 `state` 必须加 `--add-opens java.base/java.util.concurrent.locks=ALL-UNNAMED` |
 | JDK 19 ~ 21 | 虚拟线程（JEP 425 预览 / JEP 444 正式） | `synchronized` 会让虚拟线程 **pinning** 到载体线程，`ReentrantLock` 不会。虚拟线程时代"用锁还是用 synchronized"第一次有了硬指标 |
 | JDK 24 | JEP 491 | `synchronized` 不再导致虚拟线程 pinning，`ReentrantLock` 的性能优势仍然存在但不再有正确性差异 |
 
@@ -42,6 +42,16 @@ AQS 的源码在不同 JDK 里**长得不一样**，面试时如果说错版本�
 1. **JDK 8 与 JDK 17 的 AQS 是两套实现**，字段名都不同。面试时先声明"我按 JDK 8 的经典实现讲，JDK 17 重写了节点结构但语义一致"，这句话能挡掉一半的版本追问。
 2. **AQS 的对外语义（模板方法名）从 JDK 5 至今没变**：`tryAcquire`/`tryRelease`/`tryAcquireShared`/`tryReleaseShared`/`isHeldExclusively`，全部 `protected`，默认实现直接抛 `UnsupportedOperationException`。
 3. **考试重点永远是 JDK 8 的经典实现**，因为它把 CLH 队列、`waitStatus` 状态机、`park/unpark` 三件事暴露得最清楚。
+
+JDK 17 的新实现除了改字段名，机制上也换了零件，被追问"到底改了什么"时按这张表答：
+
+| 维度 | JDK 8 | JDK 17 |
+| --- | --- | --- |
+| 获取入口 | `acquire`/`acquireInterruptibly`/`doAcquireNanos`/`doAcquireShared` 每个语义一套方法 | 收敛为包级 `acquire(Node, int, boolean shared, boolean interruptible, boolean timed, long)`，返回值：正数=成功、0=超时、负数=被中断 |
+| 节点状态 | `waitStatus` + `compareAndSetWaitStatus` 逐次 CAS | `status` 位操作：`WAITING=1`、`CANCELLED=0x80000000`、`COND=2`，用 `getAndUnsetStatus` 一次原子位运算清位；`clearStatus` 则直接置 0 |
+| 取消节点清理 | `cancelAcquire` 当场摘链，摘不干净靠 `unparkSuccessor` 从 `tail` 倒序兜底 | `cleanQueue()` 惰性清理，从 `tail` 往前成对修复 `prev`/`next` |
+| 唤醒后继 | `unparkSuccessor` | `signalNext`/`signalNextIfShared`：先清 `WAITING` 位，再 `unpark(waiter)` |
+| Condition 等待 | 只能 `LockSupport.park` | `ConditionNode implements ForkJoinPool.ManagedBlocker`，在 `ForkJoinPool` 里 `await` 不会耗尽池（仅限无超时版本） |
 
 ### 1.2 显式锁 vs 内置锁
 
@@ -58,7 +68,7 @@ AQS 的源码在不同 JDK 里**长得不一样**，面试时如果说错版本�
 | 读写分离 | 无（`ReentrantReadWriteLock` 才有） | 有读写锁、`StampedLock` 乐观读 |
 | 虚拟线程 | JDK 21 会 pinning，JDK 24 修复 | 始终不 pinning |
 | 锁状态可观测 | `jstack` 显示 `waiting to lock`，无排队长度 API | `getQueueLength()`/`hasQueuedThreads()`/`getHoldCount()` 可编程观测 |
-| 性能（JDK 8 之后） | 无竞争时偏向锁/轻量级锁极快 | 无竞争时一次 CAS，接近；竞争激烈时 AQS 队列更可控 |
+| 性能（JDK 8 之后） | 无竞争时轻量级锁极快（偏向锁在 JDK 15 起已弃用并默认关闭，JDK 17 上 `-XX:+UseBiasedLocking` 会打出 "deprecated in version 15.0" 告警） | 无竞争时一次 CAS，接近；竞争激烈时 AQS 队列更可控 |
 
 选型口径：
 
@@ -75,7 +85,7 @@ AQS 的源码在不同 JDK 里**长得不一样**，面试时如果说错版本�
 | `Semaphore` | 是 | 剩余许可数 | 否 | `Semaphore.Sync` / `NonfairSync` / `FairSync` |
 | `CountDownLatch` | 是 | 剩余未完成计数 | 否，一次性 | `CountDownLatch.Sync` |
 | `ThreadPoolExecutor.Worker` | 是 | 0 未锁定，1 已锁定，-1 禁止中断 | **否** | `ThreadPoolExecutor.Worker` |
-| `FutureTask` | JDK 6 是，JDK 7+ 否 | 自实现 `state` 状态机 | 否 | `FutureTask.Sync` + `WaitNode` |
+| `FutureTask` | JDK 6 是，JDK 7+ 否 | 自实现 `state` 状态机 | 否 | `FutureTask` 自身（`state` + `WaitNode` Treiber 栈） |
 | `StampedLock` | **否** | `long`：低 7 位读计数 + 写位 + 版本号 | 否 | `StampedLock` 自维护 `WNode` 队列 |
 | `CyclicBarrier` | **否** | 用 `ReentrantLock` + `Condition` + `Generation` | — | `CyclicBarrier` |
 
@@ -224,9 +234,9 @@ private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
 
 ### 2.5 规模变大后会怎样
 
-- **队列长度**：每个 `Node` 对象在 64 位 JVM 上约 48 字节（对象头 12 + 压缩指针下的 4 个引用 16 + int 4 + 填充）。10000 个线程同时排队约 480KB，内存不是问题，问题在**下游的上下文切换**：`unpark` 一次唤醒一个，但 OS 调度器会把被唤醒线程放到运行队列，抢占式调度导致持锁线程被换出，出现"锁 convoy"现象。
-- **cacheline 争用**：未竞争的 `state` 是一个独立的 `int`，但如果同一条 cacheline 上还有其他热字段，别的核改它就会让持锁核的 cacheline 失效。JDK 9 起 `@Contended` 用于 `ThreadLocalRandom`、`Striped64` 等类，AQS 本身**没有** `@Contended`，这也是 `LongAdder` 比 `AtomicLong` 在写多读少时快一个数量级的原因。
-- **公平性成本随队列变长线性上升**：公平模式下每次获取都要读 `head`/`tail`/`head.next` 三个可能被别的核修改的字段，队列越长，这两个字段的 cacheline 迁移越频繁。
+- **队列长度**：每个 `Node` 对象在 64 位 JVM 上 32 字节（对象头 12 + 压缩指针下的 4 个引用 16 + int 4，正好 8 字节对齐、无需填充；JDK 8u421 用 `Instrumentation#getObjectSize` 实测）。10000 个线程同时排队约 320KB，内存不是问题，问题在**下游的上下文切换**：`unpark` 一次唤醒一个，但 OS 调度器会把被唤醒线程放到运行队列，抢占式调度导致持锁线程被换出，出现"锁 convoy"现象。
+- **cacheline 争用**：未竞争的 `state` 是一个独立的 `int`，但如果同一条 cacheline 上还有其他热字段，别的核改它就会让持锁核的 cacheline 失效。JDK 8 起 `Striped64.Cell` 与 `Thread` 的 `threadLocalRandomSeed` 等字段就用 `@sun.misc.Contended` 隔离（JDK 9 起换成 `jdk.internal.vm.annotation.Contended`），AQS 本身**没有** `@Contended`。`LongAdder` 比 `AtomicLong` 在写多读少时快一个数量级，主要靠 `Cell` 分段把争用分散到不同对象上，`@Contended` 只是避免相邻 `Cell` 之间的伪共享。
+- **公平性成本随队列变长线性上升**：公平模式下每次获取都要读 `head`/`tail`/`head.next` 三个可能被别的核修改的字段，队列越长，这几个字段的 cacheline 迁移越频繁。
 
 ## 三、独占模式：acquire 与 release 源码流程
 
@@ -607,7 +617,7 @@ abstract static class Sync extends AbstractQueuedSynchronizer {
 - **默认非公平**：`new Semaphore(1).isFair()` 返回 `false`。
 - **`release` 可以把许可数加回超过初始值**（`release(n)` 没有上限校验，只有溢出校验），这是设计上的取舍：`Semaphore` 只保证"许可不会少于 0"，不保证"不会多于初始值"。误用 `release` 会导致限流形同虚设。
 - **`drainPermits()`** 一次性取走全部许可（内部 CAS 把 state 置 0，返回旧值）；**`reducePermits(int)`** 是 `protected`，供子类实现动态缩容。
-- **`acquire` 的 `state` 是"剩余许可"而不是"已用许可"**：许可为 0 时 `tryAcquireShared` 返回 -1（且 `remaining == 0` 也算失败），所以 `remaining < 0` 才是失败判断——`Semaphore` 的 `remaining == 0` 恰好表示"拿到了最后一个许可"，返回值 0 停止传播。这个细节能区分"背过源码"和"只背过结论"。
+- **`acquire` 的 `state` 是"剩余许可"而不是"已用许可"**：`nonfairTryAcquireShared` 里 `remaining = available - acquires`，只有 `remaining < 0` 才是失败（许可不够）；`remaining == 0` 恰好表示"拿到了最后一个许可"，返回 0 让共享传播到此为止。这个细节能区分"背过源码"和"只背过结论"。
 
 ### 4.5 CountDownLatch 与 CyclicBarrier 的对照
 
@@ -704,7 +714,7 @@ public final void await() throws InterruptedException {
 
 1. **`addConditionWaiter()`** 先检查 `lastWaiter` 是否已被取消（`waitStatus != CONDITION`），是则调用 `unlinkCancelledWaiters()` 清理整个条件队列，避免取消节点永久占用链表。
 2. **`fullyRelease(node)`** 一次性把 `state` 全部释放并返回旧值。注意是"全部"：如果当前线程重入了 3 次，`state == 3`，这里直接 `release(3)`。**为什么必须完全释放**：`Condition` 的语义是"等待条件成立时把锁让给别人"，如果只释放一次，别的线程根本进不来，会直接死锁。返回值 `savedState` 用于恢复重入次数。
-3. **`while (!isOnSyncQueue(node)) park`**：`isOnSyncQueue` 判断节点是否已经被 `signal` 转移到同步队列（判断依据是 `node.waitStatus == CONDITION` 或 `node.prev != null` 等条件）。必须用 `while` 而不是 `if`，因为 `park` 存在**虚假唤醒**（spurious wakeup），且被 `signal` 唤醒后还要转去抢锁。
+3. **`while (!isOnSyncQueue(node)) park`**：`isOnSyncQueue` 判断节点是否已经被 `signal` 转移到同步队列（判断依据：`waitStatus == CONDITION` 或 `prev == null` 直接判定**不在**同步队列；`next != null` 直接判定**在**；都不确定时用 `findNodeFromTail` 从 `tail` 倒序兜底）。必须用 `while` 而不是 `if`，因为 `park` 存在**虚假唤醒**（spurious wakeup），且被 `signal` 唤醒后还要转去抢锁。
 4. **`acquireQueued(node, savedState)`**：注意这里复用同步器的排队逻辑，用当初保存的 `savedState` 作为参数，这就实现了"重入 3 次，醒来后依然是重入 3 次"。
 5. **中断处理**：`checkInterruptWhileWaiting(node)` 会判断中断发生在 `signal` 之前还是之后，返回 `THROW_IE`（-1，被 signal 前中断 → 抛异常）或 `REINTERRUPT`（1，被 signal 后中断 → 补标记）。
 6. **`reportInterruptAfterWait`**：`THROW_IE` 抛 `InterruptedException`，`REINTERRUPT` 调 `selfInterrupt()`。
@@ -734,7 +744,7 @@ final boolean transferForSignal(Node node) {
         return false;                             // 已被取消，放弃这个节点
     Node p = enq(node);                           // 进入同步队列
     int ws = p.waitStatus;
-    if (ws > 0 || !compareAndSwapWaitStatus(p, ws, Node.SIGNAL))
+    if (ws > 0 || !compareAndSetWaitStatus(p, ws, Node.SIGNAL))
         LockSupport.unpark(node.thread);          // 前驱已取消或置 SIGNAL 失败，直接唤醒兜底
     return true;
 }
@@ -761,6 +771,8 @@ final boolean transferForSignal(Node node) {
 | 可观测 | `jstack` 显示 `in Object.wait()` | `jstack` 显示 `parking to wait for` / `waiting on condition`，可用 `hasWaiters()` 编程检测 |
 
 `hasWaiters(Condition)`、`getWaitQueueLength(Condition)`、`getWaitingThreads(Condition)` 是 `ReentrantLock` 提供的三个可观测 API，生产里可以用来做"条件队列积压告警"。
+
+**`awaitNanos(long)` 的返回值是剩余时间，不是等待时长**：javadoc 定义为"参数值 − 已等待时间"的估计，可以 ≤ 0（≤ 0 表示时间已用完）。要"确保睡够总时长"必须 `nanosTimeout = condition.awaitNanos(nanosTimeout);` 循环，直接 `if (awaitNanos(t) <= 0) 超时` 是常见写法错误。返回 `boolean` 的只有 `await(long, TimeUnit)` 与 `awaitUntil(Date)`。
 
 ### 5.5 用 Condition 实现有界队列的骨架
 
@@ -1011,12 +1023,12 @@ protected final boolean tryRelease(int releases) {
 | --- | --- | --- | --- | --- |
 | `lock()` | `sync.lock()` → `acquire(1)` | 不响应，返回后补标记 | 无 | 对齐 `synchronized` |
 | `lockInterruptibly()` | `acquireInterruptibly(1)` | 立即抛 | 无 | 阻塞前也检查一次中断 |
-| `tryLock()` | `nonfairTryAcquire(1)` 或公平版 `tryAcquire` | 不涉及 | 无 | 非公平锁**也走插队**判断 |
+| `tryLock()` | JDK 8：`sync.nonfairTryAcquire(1)`；JDK 17：`sync.tryLock()` | 不涉及 | 无 | **公平锁也插队**：只看 `state` 是否为 0，不查队列 |
 | `tryLock(long, TimeUnit)` | `tryAcquireNanos(1, unit.toNanos(timeout))` | 抛 | 有 | 超时判定用 `System.nanoTime()` |
 | `unlock()` | `sync.release(1)` | 无 | 无 | 未持有时抛 `IllegalMonitorStateException` |
 | `newCondition()` | `sync.newCondition()` | — | — | 必须在持锁时 `await` |
 
-注意 `tryLock()` 的实现细节：`ReentrantLock#tryLock()` 直接 `return sync.nonfairTryAcquire(1);`，对公平锁则调用 `sync.tryAcquire(1)`。这意味着**公平锁的 `tryLock()` 也会尊重公平性**，非公平锁的 `tryLock()` 无视队列。
+注意 `tryLock()` 的实现细节：JDK 8 的 `ReentrantLock#tryLock()` 直接 `return sync.nonfairTryAcquire(1);`（JDK 17 改为 `sync.tryLock()`，源码注释仍写着 "Performs non-fair tryLock"）。**不管是公平锁还是非公平锁，`tryLock()` 都不尊重公平性**：只要 `state == 0`，有等待者也能插队成功。javadoc 原话是 "the untimed tryLock() method does not honor the fairness setting"，想遵守公平性得用 `tryLock(0, TimeUnit.SECONDS)`。
 
 ### 6.6 可观测 API
 
@@ -1126,7 +1138,7 @@ private transient int firstReaderHoldCount;             // 它的重入次数
 | `firstReader` / `firstReaderHoldCount` | 读锁从 0 到 1 的那个线程 | 完全绕过 `ThreadLocal` |
 | `cachedHoldCounter` | 最近一次获取读锁成功的线程 | 一次引用比较命中，省掉 `ThreadLocal.get()` |
 | `readHolds` | 其他线程 | 兜底 |
-| `ThreadLocal` 用 `tid` 而不是 `Thread` 对象 | 全部场景 | 避免 `ThreadLocalMap` 持有 Thread 引用导致泄漏，也避免读取 `Thread.threadLocalMap` 的开销 |
+| `HoldCounter` 存 `tid` 而不是 `Thread` 引用 | 全部场景 | 源码注释 "Use id, not reference, to avoid garbage retention"：`cachedHoldCounter` 是长命锁对象的字段，直接持有 `Thread` 会让已结束的线程无法回收 |
 
 `getReadHoldCount()` 的实现顺序就是这套优化：先比 `firstReader`，再比 `cachedHoldCounter.tid`，最后查 `readHolds.get()`。这段代码在面试里被问到"ThreadLocal 在高并发下有什么坑"时是绝佳素材。
 
@@ -1226,6 +1238,7 @@ final boolean apparentlyFirstQueuedIsExclusive() {
 - 非公平模式**没有**严格的读者优先或写者优先，`apparentlyFirstQueuedIsExclusive()` 只保证"写者排队后不再放新读者进来"，因此最常见的现象是**读多写少场景下写线程等待时间被拉长**，但不是必然饥饿。
 - 公平模式按到达顺序，任何一方都不会被无限推迟，代价是吞吐。
 - "读写锁一定比 `ReentrantLock` 快"是错的：读多写少、临界区短时读写锁的 `state` CAS 争用可能比独占锁更严重，尤其在 16 核以上机器上。选型必须用 JMH 实测。
+- 公平模式下 `tryLock` 同样会插队：`ReadLock#tryLock()` 走 `tryReadLock()`（源码注释 "Performs tryLock for read, enabling barging in both modes"）、`WriteLock#tryLock()` 走 `tryWriteLock()`（源码注释 "Performs tryLock for write, enabling barging in both modes"）——它们不经过 `readerShouldBlock`/`writerShouldBlock`（`writerShouldBlock` 在非公平版里的注释就是 "writers can always barge"），要公平就用带超时的 `tryLock(0, TimeUnit.SECONDS)`。
 
 ### 7.6 锁降级：唯一安全的降级路径
 
@@ -1332,7 +1345,7 @@ private static final long INTERRUPTED = 1L;   // 可中断版本返回的特殊 
 | 初始 | — | 256 | 256，`validate(256)` 为 `true` |
 | `writeLock()` | 384 | 384 | 0（返回 0 表示"有写锁，不能乐观读"） |
 | `unlockWrite(384)` | — | 512 | — |
-| `readLock()` | 513 | 513 | 513，高版本位未变 |
+| `readLock()` | 513 | 513 | 512，高版本位未变（`s & SBITS` 会把低 7 位的读计数抹掉） |
 | `unlockRead(513)` | — | 512 | — |
 | `validate(0L)` | — | — | 恒为 `false` |
 
@@ -1408,7 +1421,7 @@ public class Point {
 | --- | --- | --- |
 | **不可重入** | `readLock()` 拿两次、`writeLock()` 拿两次都会自锁死 | 与 `ReentrantLock` 最大的行为差异，从 `ReentrantLock` 迁移过来容易踩 |
 | 不支持 `Condition` | 没有 `newCondition()` | 需要条件等待只能用 `ReentrantLock` |
-| 不实现 `Lock`/`ReadWriteLock` | 只提供 `asReadWriteLock()` 视图 | 该视图只支持 `tryLock`/`unlock`，**不支持乐观读**，也不能与已有代码直接互换 |
+| 不实现 `Lock`/`ReadWriteLock` | 用 `asReadLock()`/`asWriteLock()`/`asReadWriteLock()` 拿视图 | 视图提供 `Lock` 的 `lock`/`tryLock`/`unlock`（含超时与可中断版本），但**不提供乐观读**，`newCondition()` 抛 `UnsupportedOperationException` |
 | 中断语义特殊 | `readLock()`/`writeLock()` 不可中断；`readLockInterruptibly()`/`writeLockInterruptibly()` 可中断并返回 `INTERRUPTED`（1） | 拿到 `INTERRUPTED` 时不需要 `unlock` |
 | 读计数溢出 | 低 7 位最多 126，超出部分记在 `readerOverflow`（int） | 所以读锁持有数可以远超 126，只是超过后不再用 `state` 计数 |
 | 自旋参数 | `SPINS`、`HEAD_SPINS`、`MAX_HEAD_SPINS` 由核数决定：多核时实测为 64、1024、65536；单核时全为 0 | 单核机器上乐观读收益消失 |
@@ -1494,7 +1507,7 @@ public static Object getBlocker(Thread t) { ... }
 - **先 `unpark` 后 `park` 是有效的**：许可被"存起来"，下一次 `park` 直接消耗掉并返回。
 - **`park` 返回不代表被 `unpark`**：可能被中断、超时（`parkNanos`/`parkUntil`）、或者**虚假唤醒**。因此所有使用 `park` 的地方都必须在循环里重新校验条件——AQS 的 `for (;;)` 就是这个原因。
 - **`park` 不抛 `InterruptedException`**，它只是返回并保留中断标记；是否响应中断由调用方决定。
-- **blocker 参数的作用**：记录到 `Thread` 对象的 `parkBlocker` 字段（`Unsafe` 的 `PARKBLOCKER` 偏移），纯粹为了诊断。`jstack` 里那句 `parking to wait for <0x000000076b0a1b20> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)` 中的地址就是 blocker。AQS 传的是 `this`（同步器实例），所以能定位到具体是哪个锁。
+- **blocker 参数的作用**：记录到 `Thread` 对象的 `parkBlocker` 字段（`Unsafe` 偏移，JDK 8 里叫 `parkBlockerOffset`，JDK 17 改名 `PARKBLOCKER`），纯粹为了诊断。`jstack` 里那句 `parking to wait for <0x000000076b0a1b20> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)` 中的地址就是 blocker。AQS 传的是 `this`（同步器实例），所以能定位到具体是哪个锁。
 
 HotSpot 层的实现（`os_posix.cpp` 的 `Parker::park/unpark`）：每个线程有一个 `Parker` 对象，内含 `pthread_mutex_t _mutex`、`pthread_cond_t _cond` 和 `volatile int _counter`。`unpark` 把 `_counter` 置 1 并 `pthread_cond_signal`，`park` 在 `_counter == 0` 时 `pthread_cond_wait`。所以 `park/unpark` 的成本与一次 `pthread_cond_signal` + 可能的 futex syscall 相当，是微秒级——这就是 AQS 尽量"自旋两次再 park"的根本原因。
 
@@ -1521,7 +1534,7 @@ HotSpot 层的实现（`os_posix.cpp` 的 `Parker::park/unpark`）：每个线�
 | `park` 期间被中断 | `true` | 立即返回 | `parkAndCheckInterrupt()` 用 `Thread.interrupted()` 读走并清除标记，记录 `interrupted = true` |
 | `unpark` 与 `interrupt` 同时到达 | `true` | 返回一次 | 同上，最终拿到锁后 `selfInterrupt()` 把标记补回 |
 
-`Thread.interrupted()` 与 `Thread.currentThread().isInterrupted()` 的区别是高频考点：**前者会清除标记，后者不会**。AQS 必须用前者，因为它要在循环中持续检查，如果不清除就会每次自旋都"以为被中断过"，逻辑上不会错（因为只是记录一个 boolean），但语义上会丢失"中断只发生一次"的信息；更重要的是 `acquireInterruptibly` 系列需要在抛出异常前把标记清干净，避免上层再次收到中断。
+`Thread.interrupted()` 与 `Thread.currentThread().isInterrupted()` 的区别是高频考点：**前者会清除标记，后者不会**。AQS 必须用前者，原因是**中断标记置位时 `LockSupport.park` 会立即返回**（JDK 8u421 与 JDK 17.0.12 实测：标记置位时 `park()` 几十微秒就返回，清掉标记后再 `park` 才会真正阻塞），只读不清的话等待循环会退化成忙等自旋、CPU 打满；清掉标记后由 `selfInterrupt()` 在拿到锁返回前补回，语义不丢。`acquireInterruptibly` 系列同样靠它取走标记，再决定是否抛 `InterruptedException`。
 
 ### 9.4 线程 park 状态迁移
 
@@ -1624,7 +1637,7 @@ public class NonReentrantLock implements Lock, java.io.Serializable {
 | `tryRelease` 用 `setState` 而不是 `CAS` | 只有 owner 会执行到这里 | 少一次原子操作，语义上安全（与 `ReentrantLock#tryRelease` 一致） |
 | `tryRelease` 必须返回 `true` | AQS 的 `release` 依赖返回值决定是否 `unparkSuccessor` | 返回 `false` 会导致后继线程永久 park |
 | 必须实现 `isHeldExclusively` | 返回 `getState() == 1` | `ConditionObject#await` 会先校验它，缺失或不正确会抛 `IllegalMonitorStateException` |
-| 外部类不能直接调 `tryAcquire` | 包一层 `tryLockOnce()` | `AQS#tryAcquire` 是 `protected`，非子类且非 `java.util.concurrent.locks` 包内的类无法访问。这也是自研同步器最常编译不过的地方 |
+| 外部类调用 `tryAcquire` | 包一层 `tryLockOnce()`（直接写 `sync.tryAcquire(1)` 也能编译，前提是 `sync` 的静态类型是 `Sync`） | `AQS#tryAcquire` 是 `protected`：用 `AbstractQueuedSynchronizer` 类型的引用调用必然编译不过；用同包的子类 `Sync` 类型调用是允许的。这是自研同步器最常踩的编译坑 |
 
 ### 10.3 与 ReentrantLock 的行为差异
 
@@ -1826,7 +1839,7 @@ AQS 的 `unparkSuccessor` 只唤醒一个线程，天然没有惊群。但代价
 `state` 是 `int`，`head`/`tail` 是引用，三者大概率在同一条 64 字节 cacheline 上（对象头 12 字节 + 字段）。高并发下每次 CAS `state` 都会让其他核持有的 `head`/`tail` 缓存行失效。JDK 没有为 AQS 加 `@Contended`，因为它假设"同一时刻只有一个线程改 state，队列操作频率低"。如果实测发现 cacheline 迁移是热点，正确的方向是**分段**（`LongAdder`/`ConcurrentHashMap` 的思路），不是给 AQS 打补丁。
 
 **4. 虚拟线程下的规模变化。**
-JDK 21 的虚拟线程遇到 `synchronized` 会 pinning 载体线程，遇到 `ReentrantLock` 不会。在"百万虚拟线程抢同一把锁"的场景下，`ReentrantLock` 是唯一可行选择（JDK 24 的 JEP 491 修掉了 `synchronized` 的 pinning，但仍建议在虚拟线程时代统一用显式锁，便于观测与中断）。百万级等待线程意味着百万个 `Node`，此时 **队列本身的内存**（约 48 字节 × 100 万 ≈ 48MB）与队列操作（`enq`/`unparkSuccessor` 的链表遍历）开始显著：`unparkSuccessor` 的倒序扫描在大量 `CANCELLED` 节点时是 O(n)，实践中要避免"大量线程带超时轮询同一把锁"。
+JDK 21 的虚拟线程遇到 `synchronized` 会 pinning 载体线程，遇到 `ReentrantLock` 不会。在"百万虚拟线程抢同一把锁"的场景下，`ReentrantLock` 是唯一可行选择（JDK 24 的 JEP 491 修掉了 `synchronized` 的 pinning，但仍建议在虚拟线程时代统一用显式锁，便于观测与中断）。百万级等待线程意味着百万个 `Node`，此时 **队列本身的内存**（约 32 字节 × 100 万 ≈ 32MB）与队列操作（`enq`/`unparkSuccessor` 的链表遍历）开始显著：`unparkSuccessor` 的倒序扫描在大量 `CANCELLED` 节点时是 O(n)，实践中要避免"大量线程带超时轮询同一把锁"。
 
 ## 高级岗三问
 
@@ -1922,7 +1935,7 @@ JDK 21 的虚拟线程遇到 `synchronized` 会 pinning 载体线程，遇到 `R
 2. `nonfairTryAcquire` 与公平版 `tryAcquire` 的 diff 只有一行 `!hasQueuedPredecessors() &&`。
 3. 非公平的代价：队列线程可能被反复插队，没有严格 FIFO 保证；收益：高竞争下吞吐通常高一个数量级（减少上下文切换）。
 4. 可重入实现相同：`current == getExclusiveOwnerThread()` 时 `state + acquires`，溢出抛 `Error("Maximum lock count exceeded")`。
-5. `tryLock()` 的坑：非公平锁的 `tryLock()` 走 `nonfairTryAcquire`，无视队列；公平锁走 `tryAcquire`，尊重公平性。
+5. `tryLock()` 的坑：**公平锁的 `tryLock()` 也不公平**——JDK 8 里它固定走 `nonfairTryAcquire`（JDK 17 走 `sync.tryLock()`），只看 `state` 是否为 0，不查队列；要遵守公平性得用 `tryLock(0, TimeUnit.SECONDS)`。
 
 **追问**：`synchronized` 是公平的吗？答：不是，而且无法配置。JDK 的 `ObjectMonitor` 有 `_cxq`/`_EntryList` 两级队列，语义上是"非公平但避免饥饿"的策略，与 AQS 的非公平不完全相同。
 
@@ -1936,7 +1949,7 @@ JDK 21 的虚拟线程遇到 `synchronized` 会 pinning 载体线程，遇到 `R
 3. 返回 `false` 就回到 `for` 循环再试一次 `tryAcquire`。两次自旋的成本是两次 CAS 尝试，收益是不必触碰 `pthread_cond`，避免微秒级的 park/unpark 往返。
 4. 拿下后 `setHead(node)` 出队：`head = node; node.thread = null; node.prev = null`，注意**不清 `node.next`**。
 
-**追问**：`node.thread = null` 为什么必要？答：让旧 head 的引用不再持有线程对象，帮助 GC；同时 `thread == null` 是"这是一个哨兵/已完成节点"的判据，`unparkSuccessor` 与 `apparentlyFirstQueuedIsExclusive` 都依赖它。
+**追问**：`node.thread = null` 为什么必要？答：让旧 head 的引用不再持有线程对象，帮助 GC；同时 `thread == null` 是"这是哨兵/已出队节点"的判据，`apparentlyFirstQueuedIsExclusive` 就是用 `s.thread != null` 判断队首是不是真正在排队的线程。
 
 ### Q5. `state` 已经是 `volatile` 了，为什么还要 CAS？只靠 volatile 行不行？
 
@@ -1973,7 +1986,7 @@ JDK 21 的虚拟线程遇到 `synchronized` 会 pinning 载体线程，遇到 `R
 2. 为什么能这么拆：写是独占的，同一时刻只有一个写线程，低 16 位只需要记重入次数；读是共享的，高 16 位是所有线程的持有总数。
 3. 达到上限抛 `Error("Maximum lock count exceeded")` 而不是静默溢出——状态错乱比崩溃更危险。
 4. 读锁的**每线程**计数不在 `state` 里，而用 `firstReader`/`firstReaderHoldCount` + `cachedHoldCounter` + `ThreadLocalHoldCounter` 三级结构。为什么需要：释放读锁时要校验"当前线程到底持有了几次"，纯全局计数做不到。
-5. `HoldCounter.tid` 用 `Unsafe` 读 `Thread.tid` 而不是持有 `Thread` 引用，避免 `ThreadLocalMap` 造成线程无法回收。
+5. `HoldCounter.tid` 用 `Unsafe` 读 `Thread.tid` 而不是持有 `Thread` 引用，避免锁对象（`cachedHoldCounter` 是 `Sync` 的字段）让已结束的线程无法回收。
 
 **追问**：如果读线程超过 65535 个会怎样？答：抛 `Error`。这在实际系统中几乎不可能，因为 65535 个线程本身就会先耗尽内存与 `ulimit -u`。可以顺势补充"读锁计数溢出的真实风险是**未释放**的读锁累积"，而不是线程数本身。
 
@@ -2001,7 +2014,7 @@ JDK 21 的虚拟线程遇到 `synchronized` 会 pinning 载体线程，遇到 `R
 4. 快的条件：读占比极高、临界区只有几个字段的读取、写操作稀疏。**慢/危险的条件**：不可重入（重复 `readLock` 自锁死）、无 `Condition`、无公平性、字段是 `long`/`double` 时理论上有撕裂读。
 5. 选型建议：读:写 > 90:10 且读操作是纯字段读取时用 `StampedLock`；其余情况 `ReentrantReadWriteLock` 或 `ReentrantLock` 更安全。任何"哪个更快"的结论都要用 JMH 实测，不要凭感觉。
 
-**追问**：为什么读计数上限是 `RFULL = 126` 而不是 127？答：低 7 位中 bit 7 被写位占用（`WBIT = 1 << 7`），实际可用读位是 0~6，而 `RFULL` 再留一位做保护，超过后计数转到 `readerOverflow`（int 字段）累加，所以读锁实际持有数可以远超 126。
+**追问**：为什么读计数上限是 `RFULL = 126` 而不是 127？答：读计数占 bit 0~6（7 位，能表示到 127），但源码把最大值 `RBITS = 127` 留作**保护溢出计数的自旋锁哨兵**（类注释：treating the max reader count value (RBITS) as a spinlock protecting overflow updates；`tryIncReaderOverflow` 会先把 `state` 置成含 `RBITS` 的值，改完 `readerOverflow` 再写回），所以可用上限是 `RFULL = RBITS - 1 = 126`；超过后计数转到 `readerOverflow`（int 字段）累加，读锁实际持有数可以远超 126。
 
 ### Q10. park/unpark 与 wait/notify 的区别？AQS 里为什么要 `parkAndCheckInterrupt` 后再 `selfInterrupt`？
 

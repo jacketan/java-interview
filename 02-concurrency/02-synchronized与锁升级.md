@@ -158,7 +158,7 @@ HotSpot 里一个 Java 对象在堆上的布局分三块：
 
 | 区域 | 长度（64 位 JVM，开启压缩指针） | 内容 |
 | --- | --- | --- |
-| 对象头 Mark Word | 8 字节 | 哈希码、GC 分代年龄、锁状态标志、偏向线程 ID、偏向时间戳 |
+| 对象头 Mark Word | 8 字节 | 哈希码、GC 分代年龄、锁状态标志、偏向线程 ID、epoch（偏向纪元） |
 | 对象头 Klass Pointer | 4 字节（压缩）/ 8 字节（不压缩） | 指向方法区中该类的 `InstanceKlass` |
 | 实例数据 | 不定 | 字段内容，按 `long/double`、`int/float`、`short/char`、`byte/boolean`、引用 的顺序排列并做字段重排优化 |
 | 对齐填充 | 0~7 字节 | 保证对象总大小是 8 字节的整数倍 |
@@ -169,18 +169,18 @@ HotSpot 里一个 Java 对象在堆上的布局分三块：
 
 Mark Word 是一个**复用的 64 位字**，同一个字在不同锁状态下含义完全不同。JDK 8 的 64 位布局如下（这是 `markOop.hpp` 里定义的经典布局，也是面试最常考的版本）：
 
-| 锁状态 | 62~25 位（38 位） | 24 位 | 23~10 位（14 位） | 9 位 | 8~2 位（7 位） | 1~0 位（2 位） |
+| 锁状态 | 位 63~39（25 位） | 位 38~8（31 位） | 位 7 | 位 6~3（4 位） | 位 2（偏向标志） | 位 1~0（锁标志） |
 | --- | --- | --- | --- | --- | --- | --- |
-| 无锁 | unused | identity_hashcode | unused | 分代年龄 | unused | 01 |
-| 偏向锁 | 偏向线程 ID（54 位中的高 54 位，实际用到 62~25 区段） | epoch | unused | 分代年龄 | unused | 01 |
-| 轻量级锁 | 指向栈中 Lock Record 的指针（62 位） | | | | | 00 |
-| 重量级锁 | 指向 ObjectMonitor 的指针（62 位） | | | | | 10 |
-| GC 标记 | 空 | | | | | 11 |
+| 无锁 | unused | identity_hashcode | unused | 分代年龄 | 0 | 01 |
+| 偏向锁 | 偏向线程 ID（54 位，占位 63~10） | epoch（2 位，占位 9~8） | unused | 分代年龄 | 1 | 01 |
+| 轻量级锁 | 指向栈中 Lock Record 的指针（62 位，占位 63~2） | | | | | 00 |
+| 重量级锁 | 指向 ObjectMonitor 的指针（62 位，占位 63~2） | | | | | 10 |
+| GC 标记 | 空（占位 63~2） | | | | | 11 |
 
 注意两个要点：
 
 1. **无锁和偏向锁的最后两位都是 `01`**，靠**第 3 位（bit 2）的偏向标志位**区分。JDK 8 里偏向锁状态下 bit 2 为 1，无锁状态下 bit 2 为 0。
-2. **`identity_hashcode` 只有 31 位**，这就是为什么 `Object#hashCode` 返回 `int`。一旦调用过 `System.identityHashCode(obj)` 或 `obj.hashCode()`（未被重写时），Mark Word 里就写入了哈希值，**偏向锁就再也无法建立**——因为偏向锁需要占用那 38 位存线程 ID，哈希值没地方放。
+2. **`identity_hashcode` 只有 31 位**（占第 8~38 位，正好能塞进一个 `int`）。一旦调用过 `System.identityHashCode(obj)` 或 `obj.hashCode()`（未被重写时），Mark Word 里就写入了哈希值，**偏向锁就再也无法建立**——因为偏向锁要用第 10~63 位（54 位）存线程 ID，哈希值占的第 8~38 位与它重叠，两者没法共存。
 
 第 2 点是极高频的坑：**在偏向锁场景下，一旦对象计算过 identity hash code，就会直接禁用该对象的偏向锁**。所以"为什么我的程序里偏向锁没生效"的答案之一就是代码里某处调用了 `hashCode()`。这也是为什么 `HashMap` 的 key 对象做偏向锁没有意义——`HashMap` 会调用 `key.hashCode()`。
 
@@ -238,7 +238,7 @@ Instance size: 16 bytes
 | 关闭偏向锁 | `-XX:-UseBiasedLocking` |
 | 关闭偏向锁延迟 | `-XX:BiasedLockingStartupDelay=0` |
 | 查看 monitor 相关参数 | `java -XX:+UnlockDiagnosticVMOptions -XX:+PrintFlagsFinal -version \| grep -i monitor` |
-| 查看对象布局 | `java -XX:+UnlockDiagnosticVMOptions -XX:+PrintFieldLayout`（JDK 15+ 的调试选项，需 `-XX:+UnlockDiagnosticVMOptions`） |
+| 查看字段布局 | `java -XX:+UnlockDiagnosticVMOptions -XX:+PrintFieldLayout`（**notproduct 选项，只有 debug/fastdebug 版 JVM 能用**；产品版 JDK 8/17 上会直接报 `VM option 'PrintFieldLayout' is notproduct`） |
 
 `-XX:+PrintFlagsFinal` 在本机 **JDK 8（1.8.0_421）** 上的真实输出片段，下面每一行都是实跑结果：
 
@@ -430,12 +430,14 @@ sequenceDiagram
 
 所以偏向撤销的流程是：
 
-1. 请求方（T2）发现偏向线程不是自己，把该对象的偏向撤销请求挂到 VM 的 `VM_Thread` 操作队列。
+1. 请求方（T2）发现偏向线程不是自己，构造一个 `VM_RevokeBias`（批量场景是 `VM_BulkRevokeBias`）交给 `VMThread` 执行。
 2. 等到**全局安全点**，所有线程 STW。
 3. 检查原偏向线程 T1 的栈帧：如果在临界区，把 Mark Word 升级为轻量级锁（标记为 `00`，并把 T1 的 Lock Record 写回）；如果不在临界区，把 Mark Word 重置为匿名偏向或直接重偏向给 T2。
 4. 恢复所有线程。
 
 代价很直白：**一次偏向撤销 = 一次 STW**。如果程序里存在大量"多线程轮流访问同一批对象"的模式，偏向锁会变成负优化。这正是 JDK 15 关闭它的原因。
+
+**怎么确认撤销真的在发生**：JDK 8 加 `-XX:+TraceBiasedLocking`（product 参数，默认 `false`）会打印 `Revoking bias of object 0x... , type java.lang.Object , allow rebias 0`；再配上 `-XX:+PrintSafepointStatistics -XX:PrintSafepointStatisticsCount=1`，就能在 safepoint 日志里看到名为 `RevokeBias` 的 VM operation（JDK 8u421 实测输出）。线上日志里 `RevokeBias` 频繁出现，说明偏向锁对这套代码就是负优化。
 
 ### 4.3 批量重偏向与批量撤销
 
@@ -585,12 +587,12 @@ sequenceDiagram
 锁膨胀（inflation）发生在轻量级锁自旋失败时，由 `ObjectSynchronizer::inflate` 完成：
 
 1. 检查对象 Mark Word 是否已经指向 `ObjectMonitor`（可能已被其他线程膨胀）。如果是，直接返回已有的 monitor。
-2. 如果 Mark Word 仍是 `00`（轻量级锁），从**全局空闲 monitor 列表**（`gFreeList`）取一个 `ObjectMonitor`；如果列表为空，向 `omAlloc` 申请新内存。
+2. 如果 Mark Word 仍是 `00`（轻量级锁），调用 `ObjectSynchronizer::omAlloc` 拿一个 `ObjectMonitor`：它先取当前线程私有的 `omFreeList`，取不到再从全局 `gFreeList` 批量补充，两者都空时才 `new ObjectMonitor[_BLOCKSIZE]` 分配新块。
 3. 初始化 `ObjectMonitor`：`_header` 设为对象的原 Mark Word（即 displaced header），`_object` 指向锁对象。
 4. 用 CAS 把对象 Mark Word 替换为"指向该 `ObjectMonitor` 的指针"，低两位设为 `10`。
 5. 当前线程进入 `ObjectMonitor::enter` 尝试获取。
 
-注意第 2 步：**`ObjectMonitor` 是复用的，不是每次膨胀都新建**。JDK 8 里 monitor 由 `ObjectSynchronizer` 的全局空闲列表（`gFreeList`）管理，总数上限受 `-XX:MonitorBound` 控制，**JDK 8 上该参数默认值为 0，表示不限制 monitor 数量**。配套还有一个 **monitor deflation** 机制：VM 会周期性尝试回收那些 `_owner` 为空、`_EntryList` 与 `_cxq` 均为空的空闲 monitor，把内存还回空闲列表。
+注意第 2 步：**`ObjectMonitor` 是复用的，不是每次膨胀都新建**。JDK 8 里 monitor 由 `ObjectSynchronizer` 统一管理，`-XX:MonitorBound`（**默认 0**）不是硬上限，而是"在用 monitor 数"的阈值：超过它 VM 会主动诱发一次 STW safepoint 去执行 deflate，**默认值 0 表示不主动诱发**。配套的 **monitor deflation** 机制会回收那些 `_owner` 为空、`_EntryList` 与 `_cxq` 均为空的空闲 monitor，把内存还回空闲列表。
 
 版本差异要说清楚，不要张冠李戴：
 
@@ -617,9 +619,8 @@ sequenceDiagram
 | `_WaitSet` | `ObjectWaiter*` | 调用 `Object#wait()` 后进入的等待队列 |
 | `_succ` | `Thread*` | 预设的继承者线程（successor），用于减少 unpark 竞争 |
 | `_SpinDuration` | `int` | 该 monitor 的自旋时长统计，自适应自旋的依据 |
-| `_count` | `volatile int` | 近似估计的竞争程度 |
+| `_count` | `volatile intptr_t` | 引用计数（约等于 `_WaitSet` 与 `_EntryList` 的长度之和），deflate 时判断 monitor 是否空闲 |
 | `_Responsible` | `Thread*` | 负责在无竞争时把 monitor 归还空闲列表的线程 |
-| `_contentions` | `volatile int` | 当前竞争者计数 |
 
 三个队列的区别是本节的核心考点：
 
@@ -654,7 +655,7 @@ flowchart TD
 
 `synchronized` 是**非公平锁**，而且是刻意非公平的。原因和 `ReentrantLock` 的非公平模式一样：**允许刚到达的线程直接抢锁（barging），可以减少线程挂起/唤醒的次数**，提高吞吐。
 
-`ObjectMonitor::exit` 里的唤醒策略在不同 JDK 版本有调整，JDK 6 之后引入了 `QMode` 参数（`-XX:QMode=`，调试用）控制 `_cxq` 与 `_EntryList` 的转移策略。JDK 8 的默认策略大致是：**先尝试把 `_cxq` 中的线程转移到 `_EntryList`，然后唤醒 `_EntryList` 的头节点**，同时允许刚到达的线程抢锁。
+`ObjectMonitor::exit` 里的唤醒策略在不同 JDK 版本有调整，JDK 8 里由 `Knob_QMode` 控制 `_cxq` 与 `_EntryList` 的转移策略，它只能通过 `-XX:SyncKnobs=QMode=N` 设置（**没有独立的 `-XX:QMode` 开关**，JDK 8 上写 `-XX:QMode=2` 会直接启动失败；`Knob_QMode` 默认 0）。JDK 8 的默认策略（QMode=0）是：**先看 `_EntryList`，非空就唤醒它的头节点；`_EntryList` 为空时才把 `_cxq` 整体摘下、从 LIFO 单链表转成双向链表挂到 `_EntryList` 上（QMode=1 会顺便反转顺序）再唤醒**，同时允许刚到达的线程抢锁。
 
 这带来一个真实后果：**`synchronized` 不保证 FIFO，高竞争下可能出现线程饥饿**。如果一个线程持续在临界区外反复重入，理论上可以让等待队列里的线程长期得不到锁。JDK 的实现通过"唤醒后继 + `_succ` 预设继承者"来缓解，但**不提供公平性保证**。需要公平性就必须用 `new ReentrantLock(true)`。
 
@@ -686,7 +687,7 @@ stateDiagram-v2
 
 ### 6.5 park / unpark 与线程状态
 
-重量级锁的阻塞最终落到 `LockSupport#park`，对应 JVM 内部的 `Parker::park`，底层是 `pthread_cond_wait`（Linux）。线程状态在 `jstack` 里表现为：
+重量级锁的阻塞最终落到 JVM 内部的 `ParkEvent::park`（`JavaThread::_ParkEvent`，源码注释就写着 `for synchronized()`），Linux 上底层是 `pthread_cond_wait`。注意它和 `Unsafe#park` / `LockSupport#park` 用的 `Parker`（`JavaThread::_parker`）**不是同一个东西**，两者只是实现相似。线程状态在 `jstack` 里表现为：
 
 | 情况 | `jstack` 里的状态 | 对应代码位置 |
 | --- | --- | --- |
@@ -923,7 +924,7 @@ sequenceDiagram
 
 1. **可见性只对"同一把锁"成立**。线程 A 在 `lock1` 里写的变量，线程 B 在 `lock2` 里读不到保证。
 2. **必须在同步块内读写**。把 `x` 的读放在同步块外，即使写在线程同步块内，也得不到保证。
-3. **`synchronized` 不能替代 `volatile` 做双重检查锁定（DCL）**。经典的 DCL 单例在 JDK 5 之前用 `synchronized` 也能正确，但性能差；JDK 5 之后用 `volatile` 才是标准写法。
+3. **`synchronized` 不能替代 `volatile` 做双重检查锁定（DCL）**。DCL 的第一次判空在同步块外，`synchronized` 保护不到它：实例字段不加 `volatile` 时，构造函数里的写与"把引用赋给字段"之间没有 happens-before 约束，读线程可能看到"引用已经非 null，但对象还没构造完"——这正是 JDK 5 之前 DCL 被公认为错误写法的原因。JDK 5 起 JSR-133 修正了 JMM，`volatile` 版 DCL 才是标准写法。
 
 ### 9.4 有序性：synchronized 能防止哪些重排
 
@@ -966,7 +967,7 @@ sequenceDiagram
 | 锁状态查询 | 无 API | `isLocked()`、`isHeldByCurrentThread()`、`getHoldCount()`、`getQueueLength()` |
 | 与虚拟线程配合 | JDK 21 起 `synchronized` 会 pin 住载体线程（JDK 24 起 JEP 491 已解决） | `ReentrantLock` 不 pin，虚拟线程阻塞时会释放载体线程 |
 
-**最后一行是 2024 年之后的高频新题**。JDK 21 的虚拟线程（JEP 444）在 `synchronized` 块内阻塞时会把**载体线程（carrier thread）**一起 pin 住，导致平台线程被占用；`ReentrantLock` 没有这个问题，因为 AQS 的 `park` 能被虚拟线程调度器接管。JDK 24 的 JEP 491（Synchronize Virtual Threads without Pinning）修掉了这个限制。面试答"虚拟线程场景优先用 `ReentrantLock`"时，如果 JDK 版本是 24+，可以补充"JEP 491 之后 `synchronized` 也不再 pin 了"。
+<strong>最后一行是 2024 年之后的高频新题</strong>。JDK 21 的虚拟线程（JEP 444）在 `synchronized` 块内阻塞时会把<strong>载体线程（carrier thread）</strong>一起 pin 住，导致平台线程被占用；`ReentrantLock` 没有这个问题，因为 AQS 的 `park` 能被虚拟线程调度器接管。JDK 24 的 JEP 491（Synchronize Virtual Threads without Pinning）修掉了这个限制。面试答"虚拟线程场景优先用 `ReentrantLock`"时，如果 JDK 版本是 24+，可以补充"JEP 491 之后 `synchronized` 也不再 pin 了"。
 
 ### 10.2 锁的公平性深入
 
@@ -1187,6 +1188,8 @@ jfr print --events jdk.JavaMonitorEnter,jdk.JavaMonitorWait /tmp/lock.jfr | head
 ```
 
 `jdk.JavaMonitorEnter` 事件包含 `monitorClass`、`previousOwner`、`duration`，可以直接统计出**竞争最激烈的锁对象和持有者**。JDK 8 需要 `-XX:+UnlockCommercialFeatures -XX:+FlightRecorder`，JDK 11+ 完全开源。
+
+锁**膨胀**也有专门的 JFR 事件：`jdk.JavaMonitorInflate`，字段是 `monitorClass`、`address`、`cause`。`cause` 来自 HotSpot 的 `InflateCause`，取值有 `Monitor Enter`、`Monitor Wait`、`Monitor Notify`、`Monitor Hash Code`、`JNI Monitor Enter/Exit`、`VM Internal`；如果膨胀集中在 `Monitor Hash Code`，说明是某处 `hashCode()` 把锁膨胀掉的，跟竞争无关。
 
 ### 11.6 第五步：死锁检测
 
@@ -1409,7 +1412,7 @@ flowchart TD
 | 线程数从 50 涨到 2000 | 等待队列变长，唤醒延迟累积 | 吞吐不升反降，线程切换开销吃掉 CPU | 限流 + 减小线程池，用异步非阻塞替代 |
 | 临界区处理的数据量变大 | 持锁时间从微秒变毫秒 | 排队时间 = 线程数 × 持锁时间，线性放大 | 快照替换（`AtomicReference` + 不可变对象） |
 | 单机变集群 | 单机锁失效 | 用 `synchronized` 做"全局唯一"的假设被打破 | 换分布式锁（Redis / ZooKeeper），注意锁续期和脑裂 |
-| 从 JDK 8 升级到 JDK 17/21 | 偏向锁被移除 | 单线程反复加锁场景性能下降 | 减小锁范围，或换 `ThreadLocal`、无锁结构 |
+| 从 JDK 8 升级到 JDK 17/21 | 偏向锁已默认关闭并废弃（JDK 15 关默认、JDK 18 正式废弃，但选项仍在） | 单线程反复加锁场景性能下降 | 减小锁范围，或换 `ThreadLocal`、无锁结构 |
 | 引入虚拟线程（JDK 21） | 载体线程数量有限 | `synchronized` 阻塞导致 pin 载体线程，吞吐崩塌（JDK 24 前） | 用 `ReentrantLock`，或升级到 JDK 24+（JEP 491） |
 
 **最关键的一条**：`synchronized` 的优化（偏向锁、轻量级锁）都是**为低竞争场景设计的**。当规模增长导致竞争成为常态，这些优化全部失效并升级为重量级锁，性能特征发生**阶跃式变化**而不是线性下降。这就是为什么容量规划时必须关注锁的竞争度，而不是简单按 QPS 线性外推。
@@ -1446,7 +1449,7 @@ flowchart TD
 
 **展开（2 分钟版）**：
 1. 无锁和偏向锁低 2 位都是 `01`，靠 bit 2 的偏向标志区分。
-2. `identity_hashcode` 只有 31 位，占 Mark Word 的 62~25 位区段。**一旦调用过 `hashCode()`，偏向锁就无法建立**，因为那 38 位要用来存线程 ID。
+2. `identity_hashcode` 只有 31 位，占 Mark Word 的第 8~38 位。**一旦调用过 `hashCode()`，偏向锁就无法建立**，因为偏向锁要用第 10~63 位（54 位）存线程 ID。
 3. 轻量级锁状态存的是"指向线程栈中 Lock Record 的指针"，重量级锁状态存的是"指向 `ObjectMonitor` 的指针"。
 4. 用 JOL 可以亲眼看到：`ClassLayout.parseInstance(o).toPrintable()`，`0x1` 是无锁，`0x5` 是匿名偏向。
 
@@ -1563,7 +1566,7 @@ flowchart TD
 4. **跨实例必须用分布式锁**：Redis `SET key value NX PX 30000`，value 用唯一请求 ID，释放时用 Lua 脚本比对 value 再删除（防止误删别人的锁）。要考虑：锁续期（Redisson 看门狗默认 30 秒续期）、Redis 主从切换导致锁丢失、网络分区脑裂。
 5. **更稳的方案**：用 `ZooKeeper` 临时顺序节点，或者直接让数据库唯一约束/行锁兜底。**分布式锁不应该作为正确性的唯一保障**，业务侧要有幂等和最终一致性兜底。
 
-**追问**：锁池的 `computeIfAbsent` 有什么坑？答：JDK 8 的 `ConcurrentHashMap#computeIfAbsent` 在 mapping function 里递归调用同一个 map 的方法会死锁（同一桶重入），而且 mapping function 执行期间持有桶锁，做耗时操作会阻塞同桶的其他 key。
+**追问**：锁池的 `computeIfAbsent` 有什么坑？答：JDK 8 的 `ConcurrentHashMap#computeIfAbsent` 在 mapping function 里**递归改同一个 map** 会让线程卡在 `for(;;)` 里出不来——桶里那个占位的 `ReservationNode` 永远等不到被替换，表现是 CPU 打满的假死（不是 monitor 死锁）；JDK 9 起会直接抛 `IllegalStateException: Recursive update`。另外 mapping function 执行期间持有桶锁，做耗时操作会阻塞同桶的其他 key。
 
 ### Q12.（场景排查）线上服务线程全部 BLOCKED，怎么一步步定位？
 
@@ -1617,7 +1620,7 @@ flowchart TD
 
 ### Q15.（场景设计）JDK 8 升级到 JDK 17，发现某个接口性能下降 30%，怎么排查？
 
-**答题框架（30 秒版）**：优先怀疑偏向锁被移除（JDK 15 默认关闭，JDK 18 废弃）。用 JFR 或火焰图对比，确认热点在 `monitorenter` 相关路径，然后减小锁范围或用无锁结构替代。
+**答题框架（30 秒版）**：优先怀疑偏向锁被默认关闭（JDK 15 起默认关闭，JDK 18 废弃但选项仍在）。用 JFR 或火焰图对比，确认热点在 `monitorenter` 相关路径，然后减小锁范围或用无锁结构替代。
 
 **展开（2 分钟版）**：
 1. **确认版本行为**：JDK 15 起 `-XX:+UseBiasedLocking` 默认关闭，JDK 17 上偏向锁不再生效。单线程反复加锁的代码（比如循环里 `synchronized` 访问 `ArrayList`）会从"零 CAS"退化成"每次 CAS"。
@@ -1664,7 +1667,7 @@ flowchart TD
 **答题框架（30 秒版）**：优先用 JDK 现成的并发容器（`ConcurrentHashMap`、`LongAdder`、`CopyOnWriteArrayList`），它们内部已经做了细粒度设计；自研分段锁只在极少数场景需要，且要处理内存泄漏。
 
 **展开（2 分钟版）**：
-1. **JDK 8 的 `ConcurrentHashMap` 已经是"每桶一把锁"**：CAS 插入空桶，非空桶用 `synchronized` 锁头节点。分段数等于桶数（默认 16，扩容后更多），比 JDK 7 的 `Segment` 分段锁（默认 16 段，`-XX:ConcurrentHashMap` 相关）粒度细得多。所以**JDK 8 之后自研 `Segment` 分段锁基本没必要**。
+1. **JDK 8 的 `ConcurrentHashMap` 已经是"每桶一把锁"**：CAS 插入空桶，非空桶用 `synchronized` 锁头节点。分段数等于桶数（默认 16，扩容后更多），比 JDK 7 的 `Segment` 分段锁（默认 16 段，由构造参数 `concurrencyLevel` 指定，`DEFAULT_CONCURRENCY_LEVEL=16`）粒度细得多。所以**JDK 8 之后自研 `Segment` 分段锁基本没必要**。
 2. **`LongAdder` 的 `Cell[]`** 是另一种"分段"：按线程哈希分散到不同 cell，扩容上限是 CPU 核数向上取 2 的幂。适合高频计数，`sum()` 是弱一致的。
 3. **自研按 key 分段锁**的适用场景：需要"同一 key 串行、不同 key 并行"的业务语义（比如同一订单的操作串行）。实现用 `locks[Math.abs(key.hashCode()) % N]`，N 取 2 的幂，用 `& (N-1)` 替代取模。
 4. **必须处理的坑**：用 `ConcurrentHashMap` 做锁池时必须清理，否则 map 无限增长；用数组分段不会有这个问题，但要接受碰撞。
@@ -1694,7 +1697,7 @@ flowchart TD
 | "`volatile` 能替代 `synchronized` 做计数" | 错。`count++` 是读-改-写三步，`volatile` 不保证原子性 |
 | "`ReentrantReadWriteLock` 支持锁升级" | 错。只支持降级（持写锁时可获取读锁），不支持升级（持读锁时不能获取写锁，会死锁） |
 | "`ReentrantReadWriteLock` 是公平的" | 默认非公平，写锁可能饥饿。`apparentlyFirstQueuedIsExclusive()` 只做部分缓解，需要严格公平要用 `new ReentrantReadWriteLock(true)` |
-| "`computeIfAbsent` 里的方法可以随便耗时" | 错。它持有桶锁，耗时操作会阻塞同桶其他 key；JDK 8 里递归调用同一个 map 还会死锁 |
+| "`computeIfAbsent` 里的方法可以随便耗时" | 错。它持有桶锁，耗时操作会阻塞同桶其他 key；JDK 8 里递归改同一个 map 会让线程卡死在 `for(;;)`（JDK 9 起抛 `IllegalStateException: Recursive update`） |
 | "`Object#wait` 和 `monitorenter` 阻塞在同一个队列" | 错。`wait()` 进 `_WaitSet`，`monitorenter` 失败进 `_cxq` / `_EntryList` |
 | "偏向锁撤销不需要停顿" | 错。撤销必须 STW 到全局安全点，因为要遍历原偏向线程的栈帧 |
 | "单核机器上自旋也能加速" | 错。自旋线程会抢占持锁线程的 CPU，HotSpot 在 `os::is_MP()` 为 false 时直接跳过自旋 |

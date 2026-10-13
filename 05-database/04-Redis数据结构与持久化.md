@@ -166,7 +166,7 @@ flowchart LR
   NC -->|"L0 forward 为 NULL"| NIL
 ```
 
-图中的 `span=0` 表示最后一个节点的 forward 为 NULL，源码里不存 0 而是不累加。
+图中只画了 `forward`，没有画 `span`：`span` 表示沿该层 `forward` 跳一步跨越了多少个节点，`forward` 为 NULL 的那一层在查找时不会被累加。
 
 ### 1.6 渐进式 rehash：为什么不能让 rehash 阻塞
 
@@ -254,14 +254,14 @@ typedef struct intset {
 ```
 
 - 有序 + 连续内存 → **二分查找 O(log N)**，`intsetFind` 用 `intsetSearch`。
-- 三种宽度：`int16_t` ±32767（0~65535 无符号也可）、`int32_t`、`int64_t`。
+- 三种宽度：`int16_t`（-32768~32767）、`int32_t`、`int64_t`。
 - **升级不可逆**：插入一个超出当前宽度的整数会调用 `intsetUpgradeAndAdd` 把整个数组按新宽度重排（O(N)），且**永远不降级**。这就是"往 intset 里加一个大整数后，删掉它内存也不会降回来"的原因。
-- 触发编码转换的唯一出口是 `set-max-intset-entries`（默认 512）：元素超过 512 个转为 `OBJ_ENCODING_LISTPACK`（6.2+）或 `OBJ_ENCODING_HT`。
+- 触发编码转换的出口之一是 `set-max-intset-entries`（默认 512）：元素超过 512 个转为 `OBJ_ENCODING_LISTPACK`（6.2+）或 `OBJ_ENCODING_HT`。
 - 一旦插入非整数成员，intset 立即整体转成 listpack（6.2+）/ hashtable。
 
 ### 2.3 ziplist 与 listpack：连锁更新是 ziplist 的致命伤
 
-**ziplist**（5.0 之前 hash/zset 的小对象编码，3.2 之前 list 的编码）：
+**ziplist**（7.0 之前 hash/zset 的小对象编码，3.2 之前 list 的编码）：
 
 | 字段 | 字节 | 说明 |
 | --- | --- | --- |
@@ -329,7 +329,7 @@ typedef struct dictEntry {
 ```
 
 - 初始容量 `DICT_HT_INITIAL_SIZE = 4`，扩容后容量是第一个大于等于 `used*2` 的 2 的幂。
-- 哈希函数是 SipHash（`siphash.c`，Redis 4.0 起默认；更早是 MurmurHash2），**是否启用随机种子由 `dict` 的 `type` 决定**。如果所有 key 都用固定种子的哈希，攻击者可以构造大量哈希冲突的 key 把 dict 退化成链表（DoS），因此用户数据（如 hash、set 的成员）使用 `SIPHASH` 随机种子，而 `COMMAND` 表等固定数据用 `siphash_nocase`。
+- 哈希函数是 SipHash（`siphash.c`，Redis 4.0 起默认；更早是 MurmurHash2）。SipHash 是**带密钥（seed）的哈希**：攻击者不知道 seed，就无法构造大量哈希冲突的 key 把 dict 退化成链表（DoS）。用哪个变体由 `dictType` 的 `hashFunction` 决定——用户数据（如 hash、set 的成员）走 `dictGenHashFunction`（`siphash`），`COMMAND` 命令表走 `dictGenCaseHashFunction`（`siphash_nocase`），原因只是**命令名匹配要求大小写不敏感**，与 seed 无关。
 - 扩容时 `ht_used` 超过 `size` 的一倍即触发，负载因子上限约为 1（Redis 用一个桶平均 1 个元素作为阈值，其他实现常用 0.75）。
 
 ### 2.6 embstr 与 raw：44 这个数字怎么来的
@@ -499,7 +499,7 @@ flowchart LR
 
 原理：基于**概率计数**（LogLog 家族的调和平均改进版）。Redis 的实现：
 
-- `2^14 = 16384` 个桶（register），每个桶 6 bit 存"哈希值尾部连续 0 的个数 + 1"，最大值 63。
+- `2^14 = 16384` 个桶（register），每个桶 6 bit 存"哈希值尾部连续 0 的个数 + 1"，最大值 **51**（`HLL_Q = 64 - 14 = 50`，计数上限 `Q + 1`；6 bit 字段本身能表示到 63，但用不到）。
 - 内存：`16384 * 6 / 8 = 12288` 字节，即 **12KB**（dense 编码）；稀疏编码更小。
 - 标准误差 **0.81%**（公式 `1.04/sqrt(16384)`）。
 - 两种编码：`sparse`（稀疏，初始状态，使用 opcode 编码零值桶，达到 `hll-sparse-max-bytes` 默认 `3000` 字节后转 dense）与 `dense`（固定 12KB）。`PFDEBUG ENCODING key` 可查看。
@@ -515,7 +515,7 @@ GEO 没有独立类型，**底层就是 zset**，member 是位置名，score 是
 - `GEODIST` 用 Haversine 公式计算球面距离，可选 `m|km|mi|ft`。
 - `GEOSEARCH`（6.2 新增）替代 `GEORADIUS` / `GEORADIUSBYMEMBER` 的读语义，支持 `FROMMEMBER` / `FROMLONLAT` + `BYRADIUS` / `BYBOX`，配合 `ASC`/`DESC`/`COUNT`/`WITHCOORD`/`WITHDIST`。
 - 因为底层是 zset，**可以直接用 `ZREM` 删位置、用 `ZCARD` 数个数，也能被 `ZRANGE` 误用**（但按 score 排不等于按距离排）。
-- 9 级精度的 geohash 前缀思想：`GEOSEARCH` 的实现是先算出覆盖范围对应的 geohash 区间（9 个邻居块），再对每个区间做 zset 范围扫描，最后按真实距离过滤并排序。所以它不需要遍历所有元素。
+- geohash 前缀 + 9 个邻居块的思路：`GEOSEARCH` 的实现是先算出覆盖范围对应的 geohash 区间（9 个邻居块），再对每个区间做 zset 范围扫描，最后按真实距离过滤并排序。所以它不需要遍历所有元素。
 
 ### 3.10 Stream：唯一带 ACK 的内置消息结构
 
@@ -553,7 +553,7 @@ GEO 没有独立类型，**底层就是 zset**，member 是位置名，score 是
 
 ### 4.1 TTL 的存储结构
 
-Redis 有 4 个主库 db（`redis.conf` 的 `databases 16`，默认 **16** 个），每个 `redisDb` 有两个 dict：
+Redis 默认有 16 个库（`redis.conf` 的 `databases 16`），每个 `redisDb` 有两个 dict：
 
 ```c
 typedef struct redisDb {
@@ -564,6 +564,8 @@ typedef struct redisDb {
 ```
 
 所以**设置 TTL 本身也要占内存**：每个带 TTL 的 key 会在 `expires` 字典里多一份 dictEntry（约 32~48 字节，取决于 jemalloc size class）。大量小 key + TTL 的场景内存可能翻倍。
+
+**为什么要单独一个 `expires` 字典**：定期删除只遍历 `expires`（通常远小于键空间），不需要扫描整个 keyspace；没有 TTL 的 key 也不为此付出任何空间。代价是读一个带 TTL 的 key 要多一次 `dictFind`——`expireIfNeeded` / `keyIsExpired` 先查 `expires` 判断是否过期。
 
 常用命令与语义：
 
@@ -576,7 +578,7 @@ typedef struct redisDb {
 | `SET key v EX 10` | 原子设置值与 TTL（推荐替代 `SET` + `EXPIRE`） |
 | `GETEX key EX 10`（6.2） | 读的同时改 TTL，`PERSIST` 选项可去掉 TTL |
 
-**主从复制下过期是"主节点决定"**：从节点不主动删除过期 key（`server.masterhost != NULL` 时 `expireIfNeeded` 直接返回），只等待主节点传来的 `DEL`/`UNLINK`。因此**从节点可能读到逻辑上已过期的数据**（如果客户端直连从节点或在 3.2 以前读旧值）。Redis 3.2 起从节点读取时会判断逻辑过期（`keyIsExpired`），保证读一致性。
+**主从复制下过期是"主节点决定"**：从节点不主动删除过期 key（`server.masterhost != NULL` 时 `expireIfNeeded` 直接返回），只等待主节点传来的 `DEL`/`UNLINK`。因此**从节点的内存里会残留已经逻辑过期的 key**（主节点的删除命令到达前一直占内存）。但 Redis 3.2 起从节点在读取时会判断逻辑过期（`keyIsExpired`），过期 key 对客户端表现为不存在，不会把旧值返回给读请求。
 
 ### 4.2 惰性删除 + 定期删除
 
@@ -590,8 +592,8 @@ typedef struct redisDb {
 **定期删除（active）**：`serverCron` 里的 `activeExpireCycle()`（`expire.c`），
 
 - 默认每秒 `server.hz`（10）次，即频率 10Hz（`server.hz` 默认 `10`，`dynamic-hz yes` 时高负载会动态提高）。
-- 每轮从 `expires` 字典中**随机抽取 `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP = 20` 个 key**，删除其中已过期的。
-- 如果这一轮里**超过 25%（`ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE`）的 key 已过期**，说明过期 key 占比高，继续循环；同时受时间预算约束：快循环 `ACTIVE_EXPIRE_CYCLE_FAST_DURATION = 1000` 微秒，慢循环不超过 `ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC = 25`（即 CPU 时间的 25%）。
+- 每轮从 `expires` 字典中**随机抽取 `ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP = 20` 个 key**，删除其中已过期的。
+- 如果这一轮里**过期 key 占总采样数的比例超过 `ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE = 10`（即 10%）**，说明过期 key 占比高，继续循环；同时受时间预算约束：快循环 `ACTIVE_EXPIRE_CYCLE_FAST_DURATION = 1000` 微秒，慢循环不超过 `ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC = 25`（即 CPU 时间的 25%）。
 - 快循环（fast cycle）在 `beforeSleep` 里执行，慢循环在 `serverCron` 里执行。
 
 ```mermaid
@@ -600,7 +602,7 @@ flowchart TD
   LOOP --> SAMPLE["从 expires 随机抽 20 个 key"]
   SAMPLE --> JUDGE["逐个判断是否已过期"]
   JUDGE --> DEL["删除过期 key 并按策略同步 DEL 到从库与 AOF"]
-  DEL --> RATIO{"本轮过期比例 > 25%?"}
+  DEL --> RATIO{"本轮过期比例 > 10%?"}
   RATIO -->|"是"| BUDGET{"未超过时间预算?"}
   RATIO -->|"否"| END["结束本轮定期删除"]
   BUDGET -->|"是"| SAMPLE
@@ -608,6 +610,8 @@ flowchart TD
 ```
 
 **扫描不到会怎样**：如果实例里存在大量 TTL 相同或相近的 key（例如整点批量写入 100 万 key、TTL 都是 1 小时），它们会在同一分钟集中过期，随机采样每轮都能抽到大量过期 key，CPU 被 `activeExpireCycle` 吃掉、延迟毛刺明显。**治理手段**：写入时给 TTL 加随机抖动（`TTL + rand(0, 300)`）。
+
+**过期事件通知不保证及时**：`notify-keyspace-events Ex` 产生的 `__keyevent@0__:expired` 只在 key **被真正删除**的那一刻发出，而删除要么由访问触发（惰性删除）、要么由定期删除抽样命中触发。所以没被访问、也没被抽到的过期 key 不会立刻发通知，用它做"延时队列"会出现分钟级延迟甚至长时间收不到事件。它只适合做兜底通知（如缓存失效广播），不能当可靠调度用。
 
 ### 4.3 内存上限与 8 种淘汰策略
 
@@ -644,12 +648,12 @@ Redis 不做精确 LRU（需要一个全局双向链表，每个 key 两个指�
 - 淘汰时：`performEvictions` 反复调用 `evictionPoolPopulate`，每次从目标 dict 采样 `maxmemory-samples` 个 key，计算 idle 时间（`estimateObjectIdleTime`），放入一个固定 16 槽的**淘汰池** `evictionPoolEntry eviction_pool[EVPOOL_SIZE]`（`EVPOOL_SIZE = 16`），池按 idle 从小到大有序插入，**取池里 idle 最大的那个删除**。
 - 池跨轮保留，因此实际是"过去多轮采样里最久未访问的"，比纯随机准确得多。`maxmemory-samples` 从 5 调到 10，LRU 准确度接近理论 LRU，但 CPU 成本上升。
 
-### 4.5 近似 LFU：8 位计数器 + 16 位衰减
+### 4.5 近似 LFU：16 位衰减时间 + 8 位计数器
 
-4.0 引入，复用 `lru` 的 24 位：**高 8 位是访问频率计数器（0~255），低 16 位是上次衰减时间（分钟）**。
+4.0 引入，复用 `lru` 的 24 位：**高 16 位是上次衰减时间（分钟），低 8 位是访问频率计数器（0~255）**——`updateLFU` 写入的是 `(LFUGetTimeInMinutes()<<8) | counter`。
 
-- **计数增长**：概率递增，`lfu-log-factor`（默认 `10`）越大增长越慢。源码 `LFULogIncr`：`r = rand()/RAND_MAX`，当 `r < 1/(counter*lfu_log_factor + 1)` 时 counter++。counter 达到 255 后不再增长（不再访问也不会下降）。
-- **计数衰减**：`LFUDecrAndReturn` 按 `(now - lru低16位) / lfu-decay-time`（`lfu-decay-time` 默认 `1` 分钟）计算要减多少。`lfu-decay-time` 设为 `0` 表示每次淘汰都衰减（更激进）。
+- **计数增长**：概率递增，`lfu-log-factor`（默认 `10`）越大增长越慢。源码 `LFULogIncr`：`r = rand()/RAND_MAX`，当 `r < 1/((counter - LFU_INIT_VAL) * lfu_log_factor + 1)` 时 counter++（`LFU_INIT_VAL = 5`，减去它是为了让新 key 的前几次访问能快速把计数抬起来）。counter 达到 255 后不再增长。
+- **计数衰减**：`LFUDecrAndReturn` 先取 `ldt = lru >> 8`（高 16 位的上次衰减时间），按 `(now - ldt) / lfu-decay-time`（`lfu-decay-time` 默认 `1` 分钟）算出要减多少，再从低 8 位的 counter 里减掉。`lfu-decay-time` 设为 `0` 表示**从不按时间衰减**（源码 `num_periods = lfu_decay_time ? LFUTimeElapsed(ldt)/lfu_decay_time : 0`，此时 counter 只增不减）。
 - `OBJECT FREQ key` 查看当前计数器，需要 `maxmemory-policy` 是 LFU 之一才有效。
 - 与 LRU 的取舍：**LFU 抗"偶发批量扫盘"**（一次全表扫描不会让所有 key 变成热点），但**对新 key 不友好**（新 key 计数从 5 开始，`LFU_INIT_VAL = 5`，需要时间才能升上来，可能被误杀）。
 
@@ -677,7 +681,7 @@ flowchart TD
   FREE --> CHECK
 ```
 
-**`maxmemory` 到底限制了什么**：`used_memory`，即 Redis 自身统计的内存分配量（jemalloc 分配出去的量），**不含**客户端输出缓冲区之外的部分、复制 backlog、AOF 缓冲区？——实际上它们都计入：`INFO memory` 里 `used_memory` = `used_memory_dataset`（数据）+ `used_memory_overhead`（各种缓冲区、复制 backlog、客户端缓冲区等）。所以**给 Redis 的 `maxmemory` 应该比容器/机器的内存上限小 20%~30%**，给 fork 时的 COW 页表与 jemalloc 碎片留余量。经验值：容器 limit 4GB 时 `maxmemory` 设 3GB。7.0 起可额外用 `maxmemory-clients` 限制客户端缓冲区总量（默认 `0` 不限制）。
+**`maxmemory` 到底限制了什么**：比较的是 `used_memory`，即 Redis 自己统计的内存分配量（jemalloc 分配出去的量）。客户端输出缓冲区、复制 backlog、AOF 缓冲区**都计入**：`INFO memory` 里 `used_memory` = `used_memory_dataset`（数据）+ `used_memory_overhead`（各种缓冲区、复制 backlog、客户端缓冲区等）。它**不包含** fork 期间 COW 额外复制出来的物理页、jemalloc 碎片和 THP 浪费，所以**给 Redis 的 `maxmemory` 应该比容器/机器的内存上限小 20%~30%**，给 fork 时的 COW 页表与 jemalloc 碎片留余量。经验值：容器 limit 4GB 时 `maxmemory` 设 3GB。7.0 起可额外用 `maxmemory-clients` 限制客户端缓冲区总量（默认 `0` 不限制）。
 
 ## 五、RDB 与 AOF 持久化
 
@@ -714,7 +718,7 @@ save 60 10000    # 60 秒内至少 10000 次修改
 | `rdb-save-incremental-fsync` | `yes` | 4.0 起，每写 32MB 数据 fsync 一次，平滑 IO |
 | `rdb-del-sync-files` | `no` | 无持久化时删除主从同步用的 RDB |
 
-三种触发入口：
+四种触发入口：
 
 1. **自动**：`serverCron` 里的 `checkSaveConditions` 判断 `dirty` 计数器（自上次保存以来的写次数）与时长。
 2. **`BGSAVE`**：fork 子进程，主进程立即返回 `Background saving started`。
@@ -786,7 +790,7 @@ AOF 的写入链路分三步，理解这三步才能答对"为什么 `everysec` 
 | `appendfilename` | `appendonly.aof` | 7.0 起实际是 `appendonlydir/` 目录 |
 | `no-appendfsync-on-rewrite` | `no` | 设为 `yes` 时，AOF 重写期间不 fsync（分担 IO 压力，但丢失窗口变大） |
 | `aof-load-truncated` | `yes` | 加载时忽略尾部不完整命令（崩溃导致），只打印警告 |
-| `aof-use-rdb-preamble` | `yes` | 4.0 起默认开启混合持久化 |
+| `aof-use-rdb-preamble` | `yes` | 4.0 引入混合持久化，5.0 起默认 `yes`（4.0 默认 `no`） |
 | `aof-timestamp-enabled` | `no` | 7.0 起可在 AOF 里写注释形式的时间戳，便于按时间点恢复 |
 | `aof-rewrite-incremental-fsync` | `yes` | 重写文件时每 32MB fsync 一次 |
 
@@ -812,6 +816,8 @@ AOF 是命令日志，会无限膨胀：对一个 key 执行 100 万次 `INCR`�
 
 即"AOF 至少 64MB 且翻倍"才自动重写。也可以手动：`BGREWRITEAOF`。
 
+**`BGREWRITEAOF` 不会与 `BGSAVE` 并发**：同一时刻 Redis 只允许一个"重活"子进程。如果 `bgsave` 正在执行，`BGREWRITEAOF` 会返回 `Background append only file rewriting scheduled`，把 `server.aof_rewrite_scheduled` 置 1，等 `BGSAVE` 结束后再真正开始——这是"手动触发了重写却看不到 `aof_rewrite_in_progress`"的常见原因。
+
 **7.0 的多部分 AOF（Multi Part AOF）** 是最大的结构性变化：
 
 - 之前是一个 `appendonly.aof` 文件（重写期间主进程写旧文件 + 缓冲区，重写完成后替换）。
@@ -823,7 +829,7 @@ AOF 是命令日志，会无限膨胀：对一个 key 执行 100 万次 `INCR`�
 
 ### 5.5 混合持久化与重启恢复优先级
 
-**混合持久化**（4.0 起，`aof-use-rdb-preamble yes` 为默认）：
+**混合持久化**（4.0 引入，5.0 起 `aof-use-rdb-preamble yes` 为默认）：
 
 ```mermaid
 flowchart LR
@@ -984,7 +990,7 @@ mem_fragmentation_ratio = used_memory_rss / used_memory
 - **批次不要太大**：一次 10 万条命令会让输出缓冲区撑爆（默认 `client-output-buffer-limit normal 0 0 0` 对普通客户端不限制，但内存会涨），推荐**每批 100~1000 条**。
 - `redis-cli --pipe` 用于批量导入（`cat data.txt | redis-cli --pipe`），它用 `redis-cli` 自己实现的高效写入路径。
 - **Pipeline 与 Cluster 的坑**：`JedisCluster`/`Lettuce` 的 pipeline 必须保证同一批 key 落在同一 slot，否则报 `CROSSSLOT Keys in request don't hash to the same slot`。解决：用 hash tag（`{user1000}:name`）把相关 key 固定到同一 slot，或分组后分别 pipeline。
-- **Pipeline 不是原子**：中间可能穿插其他客户端的命令；需要原子用 `MULTI`/`EXEC`（7.0 起 `MULTI` 与 pipeline 可以混用，但注意 `WATCH` 不能出现在 `MULTI` 前被打断）或 Lua 脚本。
+- **Pipeline 不是原子**：中间可能穿插其他客户端的命令；需要原子用 `MULTI`/`EXEC` 或 Lua 脚本。`MULTI` 可以和 pipeline 混用（把 `MULTI`、若干命令、`EXEC` 一次性发出，省 RTT），但 `WATCH` 必须在 `MULTI` 之前单独发出，不能在 `MULTI` 内部使用。
 - **Lua 脚本**：一次网络往返 + 原子执行，但脚本必须**快**（Redis 有 `lua-time-limit` 默认 `5000` 毫秒的保护，超时后只允许 `SCRIPT KILL` 或 `SHUTDOWN NOSAVE`）。
 
 ## 七、慢查询日志与 latency monitor
@@ -1059,7 +1065,7 @@ flowchart TD
 | --- | --- | --- |
 | 单线程执行命令 | 多线程 + 锁保护数据 | 单命令阻塞全实例；靠 IO 线程与 Cluster 扩展 |
 | 渐进式 rehash | 一次性 rehash（阻塞但简单） | 实现变复杂；`SCAN` 语义变为"可能重复" |
-| 跳表而非平衡树 | 红黑树 / B+ 树 | 指针更多、内存略高（平均 1.33 指针/层） |
+| 跳表而非平衡树 | 红黑树 / B+ 树 | 指针更多、内存略高（每节点平均 1.33 个 forward 指针） |
 | listpack 替代 ziplist | 保留 ziplist | 每 entry 多 1~5 字节 backlen，换来无连锁更新 |
 | 近似 LRU | 精确 LRU（链表） | 淘汰不够精确，用 `maxmemory-samples` 调 |
 | 近似 LFU | 精确 LFU | 新 key 从 `LFU_INIT_VAL = 5` 起步，有误杀 |
@@ -1140,7 +1146,7 @@ flowchart TD
 
 ### Q5. Redis 的过期删除策略？为什么会有 key 明明过期了还占内存？
 
-**答题框架（30 秒版）**：惰性删除（`expireIfNeeded`，访问时判断）+ 定期删除（`activeExpireCycle`，每秒 10 次，每次随机抽 20 个 key，过期比例超 25% 就继续，受 1000us/25% CPU 的预算约束）。所以**从不被访问的过期 key 会一直占内存**，直到定期删除随机抽到它。
+**答题框架（30 秒版）**：惰性删除（`expireIfNeeded`，访问时判断）+ 定期删除（`activeExpireCycle`，每秒 10 次，每次随机抽 20 个 key，过期比例超 10% 就继续，受 1000us/25% CPU 的预算约束）。所以**从不被访问的过期 key 会一直占内存**，直到定期删除随机抽到它。
 
 **展开（2 分钟版）**：
 1. 从节点不主动删除过期 key（`expireIfNeeded` 在主从场景直接返回），靠主节点同步 `DEL`/`UNLINK`；Redis 3.2 起从节点读取时会判断逻辑过期。
@@ -1154,7 +1160,7 @@ flowchart TD
 
 **展开（2 分钟版）**：
 1. LRU：`LRU_CLOCK_RESOLUTION = 1000` 毫秒，24 位时钟最大约 194 天会回绕；命中非只读命令时更新 `robj.lru`。
-2. LFU（4.0+）：24 位拆成 8 位计数器 + 16 位衰减时间；概率递增 `1/(counter*lfu-log-factor + 1)`，`lfu-log-factor` 默认 10；衰减按 `lfu-decay-time`（默认 1 分钟）；新 key 从 `LFU_INIT_VAL = 5` 起步。
+2. LFU（4.0+）：24 位拆成高 16 位衰减时间 + 低 8 位计数器；概率递增 `1/((counter - LFU_INIT_VAL)*lfu-log-factor + 1)`，`lfu-log-factor` 默认 10；衰减按 `lfu-decay-time`（默认 1 分钟）；新 key 从 `LFU_INIT_VAL = 5` 起步。
 3. 淘汰池 `EVPOOL_SIZE = 16`，跨轮保留，所以比单轮采样准。
 4. `maxmemory` 只限制 `used_memory`，要留出 fork COW 与碎片余量，建议设为机器/容器内存的 70%~80%。
 
@@ -1201,7 +1207,7 @@ flowchart TD
 1. 写路径三步：写 `server.aof_buf`（内存）→ `beforeSleep` 里 `write()` 到 page cache → 按策略 `fsync()`。所以 `write()` 成功不代表落盘。
 2. `everysec` 的毛刺：上一次 fsync 未完成时主线程最多等 2 秒，`aof_delayed_fsync` 会累加。
 3. `aof-load-truncated yes`（默认）在崩溃导致的尾部截断时自动截断并启动；`no` 则拒绝启动，需要 `redis-check-aof --fix`。
-4. 混合持久化 `aof-use-rdb-preamble yes`（4.0+ 默认）让 AOF 前半段是 RDB 二进制、后半段是命令，重启加载快得多。
+4. 混合持久化 `aof-use-rdb-preamble yes`（4.0 引入、5.0 起默认）让 AOF 前半段是 RDB 二进制、后半段是命令，重启加载快得多。
 
 ### Q11. 场景题：重启后数据比预期少了一大截，为什么？
 
@@ -1285,9 +1291,9 @@ flowchart TD
 - 编码转换单向不可逆，删除元素不会退回去。
 - 渐进式 rehash：查两张表、新增只写 `ht[1]`、每步搬 1 桶、`serverCron` 每轮最多 1ms。
 - 跳表 `ZSKIPLIST_MAXLEVEL = 32`、`ZSKIPLIST_P = 0.25`，`span` 支持 `ZRANK`。
-- 过期 = 惰性（`expireIfNeeded`）+ 定期（每秒 10 次 × 20 个 key，过期比例 > 25% 继续，预算 1000us/25% CPU）。
+- 过期 = 惰性（`expireIfNeeded`）+ 定期（每秒 10 次 × 20 个 key，过期比例 > 10% 继续，预算 1000us/25% CPU）。
 - 淘汰 8 策略：`noeviction` + `allkeys-{lru,lfu,random}` + `volatile-{lru,lfu,random,ttl}`，默认 `noeviction`。
-- 近似 LRU：24 位秒级时钟；近似 LFU：8 位计数 + 16 位衰减（`lfu-log-factor 10`、`lfu-decay-time 1`），新 key 从 `LFU_INIT_VAL = 5` 起。
+- 近似 LRU：24 位秒级时钟；近似 LFU：低 8 位计数 + 高 16 位衰减时间（`lfu-log-factor 10`、`lfu-decay-time 1`），新 key 从 `LFU_INIT_VAL = 5` 起。
 - `maxmemory-samples` 默认 5，淘汰池 `EVPOOL_SIZE = 16`。
 - RDB 靠 fork + COW，一致性快照但有 fork 阻塞与内存放大，`rdb_last_cow_size`/`latest_fork_usec` 是关键指标；必须关 THP、设 `vm.overcommit_memory=1`。
 - AOF `appendfsync` 默认 `everysec`（最多丢 1 秒），重写是 fork 子进程遍历内存重建而非压缩旧文件，触发条件 `64mb` + 翻倍。

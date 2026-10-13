@@ -178,7 +178,7 @@ flowchart TD
 | 2.7 | 新增 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`，同时兼容旧键（旧键会打警告） | `spring.factories` |
 | 3.0+ | **只认** `AutoConfiguration.imports`，`spring.factories` 里的 `EnableAutoConfiguration` 键被彻底移除 | `spring.factories` 仍然保留 |
 
-实测数据可以佐证：`spring-boot-autoconfigure-2.5.12.jar` 的 `spring.factories` 里 `EnableAutoConfiguration` 键下有 132 个类；`spring-boot-autoconfigure-3.5.6.jar` 的 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 有 156 行，而它的 `spring.factories` 里**已经没有** `EnableAutoConfiguration` 键，只剩 `ApplicationContextInitializer`、`ApplicationListener`、`EnvironmentPostProcessor`、`AutoConfigurationImportListener`、`AutoConfigurationImportFilter`、`FailureAnalyzer`、`TemplateAvailabilityProvider` 等。
+实测数据可以佐证：`spring-boot-autoconfigure-2.5.12.jar` 的 `spring.factories` 里 `EnableAutoConfiguration` 键下有 131 个类；`spring-boot-autoconfigure-3.5.6.jar` 的 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 有 156 行，而它的 `spring.factories` 里**已经没有** `EnableAutoConfiguration` 键，只剩 `ApplicationContextInitializer`、`ApplicationListener`、`EnvironmentPostProcessor`、`AutoConfigurationImportListener`、`AutoConfigurationImportFilter`、`FailureAnalyzer`、`TemplateAvailabilityProvider` 等。
 
 3.x 里仍在 `spring.factories` 的 SPI 包括（实测清单）：
 
@@ -283,6 +283,8 @@ sequenceDiagram
 2. **写在普通 `@Configuration` 上**：用户自己的配置类之间处理顺序不确定，条件结果不可预测。Spring Boot 官方明确说 `@ConditionalOnBean`/`@ConditionalOnMissingBean` 应当只用在自动配置类中。
 3. **`@ConditionalOnMissingBean` 不写类型**：默认取方法返回类型。返回 `Object` 或接口父类型时，判定会过宽或过窄，必须显式写 `@ConditionalOnMissingBean(XxxTemplate.class)`。
 
+还有一点常被忽略：`@ConditionalOnMissingBean` 的 `search` 默认是 `SearchStrategy.ALL`，也就是**会沿父容器层级往上找**。在父子容器场景（启用 `management.server.port` 后 Boot 建的 management 子上下文、Spring Cloud 的 bootstrap 上下文）里，父容器中的同类型 Bean 会让自动配置直接退让，表现为"子容器里查不到这个 Bean"。只想看当前容器时显式写 `search = SearchStrategy.CURRENT`——Boot 自己的 `EmbeddedTomcat`/`EmbeddedJetty`/`EmbeddedUndertow` 就是这么写的。
+
 ### 4.3 自定义 Condition
 
 ```java
@@ -298,7 +300,7 @@ public class OnLinuxCondition implements Condition {
 
 - `matches` 里**不要做重活**（不要建连接、不要读远程配置），它会在启动阶段被反复调用。
 - 需要拿到方法上的注解属性时，用 `metadata.getAllAnnotationAttributes(XXX.class.getName())`，别用 `instanceof MethodMetadata` 强转。
-- 需要参与 `AutoConfigurationImportFilter` 批量过滤（性能优化）时，条件类还要实现 `ConfigurationCondition` 并提供 `getConfigurationPhase()` 与 `AutoConfigurationImportFilter`。
+- 需要参与 `AutoConfigurationImportFilter` 批量过滤（性能优化）时，条件类要额外实现 `AutoConfigurationImportFilter#match(String[], AutoConfigurationMetadata)`，并在 `spring.factories` 的 `org.springframework.boot.autoconfigure.AutoConfigurationImportFilter` 键下注册（Boot 内置的三个就是这么来的）。别和 `ConfigurationCondition#getConfigurationPhase()` 混在一起——它管的是条件在"解析配置类"还是"注册 Bean"阶段求值，与批量过滤无关。
 
 ## 五、手写一个 starter 的完整步骤
 
@@ -470,7 +472,7 @@ org.springframework.boot.autoconfigure.EnableAutoConfiguration=\
 com.example.sms.autoconfigure.SmsAutoConfiguration
 ```
 
-**兼容写法**：同时提供两个文件。2.7 会优先读 `.imports`，旧版本读 `spring.factories`，两边都不报错。但 3.0 起 `spring.factories` 那份就完全无效了，记得清理。
+**兼容写法**：同时提供两个文件。2.7 会把两份都读进来再合并去重（实测 `AutoConfigurationImportSelector#getCandidateConfigurations` 先 `SpringFactoriesLoader.loadFactoryNames` 读 `spring.factories`，再 `ImportCandidates.load` 读 `.imports`），旧版本只读 `spring.factories`，两边都不报错。但 3.0 起 `spring.factories` 那份就完全无效了，记得清理。
 
 ### 5.5 提示文件
 
@@ -652,7 +654,9 @@ spring:
 
 之后 `--spring.profiles.active=prod` 等价于同时激活三个。**2.4 起 `spring.profiles.active` 不允许出现在 profile-specific 文档里**，否则抛 `InvalidConfigDataPropertyException`。这是升级 2.3 → 2.4+ 时最常见的报错。
 
-代码里判断 profile 用 `Environment#acceptsProfiles(Profiles.of("prod"))`（2.4 起的重载），旧的无参重载已废弃。
+那 profile-specific 文档怎么声明自己的生效条件？用 **`spring.config.activate.on-profile`**（2.4 起取代旧的 `spring.profiles` 键）：同一个 `application.yml` 里用 `---` 分隔多个文档，某个文档写 `spring.config.activate.on-profile: prod`，就只在 prod 下生效。在 profile-specific 文档里改激活列表是行不通的——那等于用配置决定"该读哪些配置"，Boot 只能直接报错。
+
+代码里判断 profile 用 `Environment#acceptsProfiles(Profiles.of("prod"))`（`Profiles` 重载是 Spring Framework 5.1 起，对应 Boot 2.1；旧的 `String...` 重载自 5.1 起已废弃）。
 
 ```mermaid
 flowchart TD
@@ -684,7 +688,7 @@ flowchart TD
 | IDE 提示 | 有元数据，自动补全 | 无 |
 | 元数据文件 | configuration-processor 生成 | 无 |
 | 绑定时机 | `ConfigurationPropertiesBindingPostProcessor` 在 `postProcessBeforeInitialization` 绑定 | `AutowiredAnnotationBeanPostProcessor` 处理 |
-| 覆盖默认值 | 可整组覆盖，也支持 `@DefaultValue` 标注构造器参数（3.0 起） | 逐个覆盖 |
+| 覆盖默认值 | 可整组覆盖，也支持 `@DefaultValue` 标注构造器参数（2.2 起） | 逐个覆盖 |
 
 ### 7.2 绑定原理
 
@@ -767,24 +771,24 @@ spring:
 
 ### 9.1 createWebServer 时序
 
-Web 应用的上下文是 `AnnotationConfigServletWebServerApplicationContext`，它在 `onRefresh()` 里调用 `createWebServer()`（实测字节码：`onRefresh` 先调 `GenericWebApplicationContext.onRefresh()`，再调 `createWebServer()`）。这就是**内嵌容器的启动点**——它发生在所有单例 Bean 实例化之后、`finishRefresh()` 之前。
+Web 应用的上下文是 `AnnotationConfigServletWebServerApplicationContext`，它在 `onRefresh()` 里调用 `createWebServer()`（实测源码：`onRefresh` 先调 `GenericWebApplicationContext.onRefresh()`，再调 `createWebServer()`）。这一步是**内嵌容器的创建点**，注意 `AbstractApplicationContext#refresh` 里的顺序是 `onRefresh()` → `registerListeners()` → `finishBeanFactoryInitialization()` → `finishRefresh()`，也就是它**发生在单例 Bean 实例化之前**（`webServer` 在这个阶段创建，Tomcat 对象在这里 `initialize()`）。另外，`ServletContextInitializer`（`selfInitialize`，把 `DispatcherServlet`、Filter 注册进容器）也是在这个阶段执行完的——`TomcatWebServer` 构造器里的 `initialize()` 会 `tomcat.start()` 把 context 启起来，`TomcatStarter` 就在那时跑完所有 initializer（Boot 启动日志里"Initializing Spring embedded WebApplicationContext"就夹在"Tomcat initialized with…"与"Tomcat started on…"之间）。真正绑定连接器端口、以及 `load-on-startup` Servlet 的 `init()`，才推迟到 `finishRefresh()` 阶段 `WebServerStartStopLifecycle#start()` 调 `WebServer#start()` 时。
 
 `createWebServer()` 的逻辑：
 
-1. 从 BeanFactory 取 `ServletWebServerFactory` 类型的 Bean。找不到时（2.5.12 的字节码实测）抛的是 `ApplicationContextException`，消息为 `Unable to start ServletWebServerApplicationContext due to missing ServletWebServerFactory bean`；3.x 增加了 `MissingWebServerFactoryBeanFailureAnalyzer`（`org.springframework.boot.web.context`）把它转成带 `Action` 的可读报告。找到多个会抛 `IllegalStateException`。
+1. 从 BeanFactory 取 `ServletWebServerFactory` 类型的 Bean。找不到时（2.5.12 实测）抛的是 `ApplicationContextException`，消息为 `Unable to start ServletWebServerApplicationContext due to missing ServletWebServerFactory bean`；2.7 起（`@since 2.7.0`，实测 2.7.18 已是）改成抛 `MissingWebServerFactoryBeanException`，并加了 `MissingWebServerFactoryBeanFailureAnalyzer`（`org.springframework.boot.web.context`）把它转成带 `Action` 的可读报告。**找到多个也是抛 `ApplicationContextException`**（两个版本都一样），消息里会列出所有 Bean 名。
 2. 收集容器里所有 `ServletContextInitializer`（包括 `DispatcherServlet` 的注册器、Filter 注册器）。
 3. 调用 `factory.getWebServer(initializers...)` 得到 `WebServer`。
-4. 把 `WebServer` 包成 `WebServerStartStopLifecycle` 注册进容器，并发布 `ServletWebServerInitializedEvent`。
+4. 把 `WebServer` 分别包成 `webServerGracefulShutdown` 与 `webServerStartStop` 两个 `SmartLifecycle` 注册进容器；`ServletWebServerInitializedEvent` 不是在注册时发布的，而是在 `WebServerStartStopLifecycle#start()` 里发布（此时才拿得到真实端口）。
 
 ### 9.2 自动配置与条件
 
-`ServletWebServerFactoryAutoConfiguration` 内部用三个嵌套配置类做互斥选择：
+`ServletWebServerFactoryAutoConfiguration` 通过 `@Import` 引入 `ServletWebServerFactoryConfiguration` 的三个嵌套配置类，互斥靠每个类上都有的 `@ConditionalOnMissingBean(value = ServletWebServerFactory.class, search = SearchStrategy.CURRENT)`：
 
 | 嵌套配置类 | 生效条件（类路径判断） | 产出 |
 | --- | --- | --- |
 | `EmbeddedTomcat` | `Servlet`、`Tomcat`、`UpgradeProtocol` 都存在 | `TomcatServletWebServerFactory` |
-| `EmbeddedJetty` | `Servlet`、`Server`、`Loader` 都存在 | `JettyServletWebServerFactory` |
-| `EmbeddedUndertow` | `Servlet`、`Undertow` 都存在 | `UndertowServletWebServerFactory` |
+| `EmbeddedJetty` | `Servlet`、`Server`、`Loader`、`WebAppContext` 都存在 | `JettyServletWebServerFactory` |
+| `EmbeddedUndertow` | `Servlet`、`Undertow`、`SslClientAuthMode` 都存在 | `UndertowServletWebServerFactory` |
 
 条件里额外加了 `@ConditionalOnClass({ Servlet.class, Tomcat.class, UpgradeProtocol.class })` 这样的"防误判"组合——只判断 `Tomcat.class` 不够，因为其它库也可能带上 Tomcat 的部分类。
 
@@ -881,7 +885,7 @@ classDiagram
 </dependency>
 ```
 
-**必须显式排除 `spring-boot-starter-tomcat`**。因为 `EmbeddedTomcat` 的条件写在 `EmbeddedJetty`/`EmbeddedUndertow` 前面，只要 Tomcat 类还在类路径上，就会优先生效。只加 Undertow 依赖而不排除 Tomcat，是"换了没生效"的头号原因。
+**必须显式排除 `spring-boot-starter-tomcat`**。三个嵌套类都带 `@ConditionalOnMissingBean(ServletWebServerFactory)`，按 `@Import` 的顺序求值（Tomcat → Jetty → Undertow）：Tomcat 的类路径条件先成立并注册 `TomcatServletWebServerFactory`，后两个看到容器里已经有 `ServletWebServerFactory` 就各自退让。所以只要 Tomcat 类还在类路径上就换不掉。只加 Undertow 依赖而不排除 Tomcat，是"换了没生效"的头号原因。
 
 线程模型对照：
 
@@ -891,6 +895,8 @@ classDiagram
 | Undertow | `server.undertow.threads.io` | `server.undertow.threads.worker` | 都不设时用 Undertow `Builder` 默认：io 为 `max(availableProcessors, 2)`，worker 为 `io * 8` |
 | Jetty | acceptor + selector | `QueuedThreadPool` | max 200 / min 8 |
 
+**Boot 3.2 起可以切虚拟线程**：`spring.threads.virtual.enabled=true`（还要求 JDK 21+，两个条件都满足才生效）。Tomcat 与 Jetty 在 3.2 起分别由 `TomcatVirtualThreadsWebServerFactoryCustomizer`（order 为 `TomcatWebServerFactoryCustomizer.ORDER + 1`，把 Connector 的 executor 换成 `VirtualThreadExecutor`）与 `JettyVirtualThreadsWebServerFactoryCustomizer` 切过去；Undertow 从 3.4 起才支持，做法是注册一个 `UndertowDeploymentInfoCustomizer` 把 `DeploymentInfo` 的 executor 换成 `VirtualThreadTaskExecutor`（实测 3.3.13 里还没有这个 Bean）。此时 `server.tomcat.threads.max`、`min-spare` 不再决定并发度（`ServerProperties` 里这两项直接注了"启用虚拟线程时无效"，Jetty 的 `threads.max`/`min` 同理；Undertow 的 `threads.worker` 没有这句注释，但请求执行已改由虚拟线程 executor 接管），容量规划要改成盯下游连接池与 CPU。
+
 **什么时候换 Undertow**：内存敏感（Undertow 更省内存）、需要 HTTP/2 与长连接优化。**什么时候不换**：团队只熟悉 Tomcat、依赖 Tomcat 特有 API（如 `RemoteIpValve` 之外的 valve 定制）、排查工具链围绕 Tomcat 建立。性能差异在常规业务下不是决定因素，**不要为了换而换**。
 
 ```mermaid
@@ -899,14 +905,14 @@ flowchart TD
   CWS --> GF["getWebServerFactory 从 BeanFactory 取唯一 ServletWebServerFactory"]
   GF --> AC["ServletWebServerFactoryAutoConfiguration"]
   AC --> T["EmbeddedTomcat 条件为 Servlet 与 Tomcat 与 UpgradeProtocol 都存在"]
-  AC --> J["EmbeddedJetty 条件为 Servlet 与 Server 与 Loader 都存在"]
-  AC --> U["EmbeddedUndertow 条件为 Servlet 与 Undertow 都存在"]
+  AC --> J["EmbeddedJetty 条件为 Servlet 与 Server 与 Loader 与 WebAppContext 都存在"]
+  AC --> U["EmbeddedUndertow 条件为 Servlet 与 Undertow 与 SslClientAuthMode 都存在"]
   T --> CUST["WebServerFactoryCustomizerBeanPostProcessor 排序后依次应用"]
   CUST --> SP["ServletWebServerFactoryCustomizer order 0"]
   CUST --> TC["TomcatWebServerFactoryCustomizer order 0"]
   SP --> WS["TomcatWebServer 启动 Connector 协议为 Http11NioProtocol"]
   TC --> WS
-  WS --> LIFE["包装为 WebServerStartStopLifecycle phase 为 MAX_VALUE 减 1"]
+  WS --> LIFE["包装为 WebServerStartStopLifecycle 由 finishRefresh 阶段启动"]
   U --> UW["UndertowServletWebServerFactory 产出 UndertowServletWebServer"]
 ```
 
@@ -916,7 +922,7 @@ flowchart TD
 
 `new SpringApplication(Class<?>... primarySources)` 做四件事：
 
-1. `deduceFromClasspath()` 推断 `WebApplicationType`：类路径有 `org.springframework.web.reactive.DispatcherHandler` 且没有 `jakarta.servlet.Servlet` 与 `ConfigurableWebApplicationContext` → `REACTIVE`；两个 Web 类都存在 → `SERVLET`；否则 `NONE`。结果存在 `webApplicationType` 字段，可用 `spring.main.web-application-type` 或 `SpringApplication#setWebApplicationType` 强制覆盖。
+1. `WebApplicationType.deduceFromClasspath()` 推断 `WebApplicationType`：类路径有 `org.springframework.web.reactive.DispatcherHandler`，且**没有** `org.springframework.web.servlet.DispatcherServlet` 与 Jersey 的 `org.glassfish.jersey.servlet.ServletContainer` → `REACTIVE`；否则逐个检查 `SERVLET_INDICATOR_CLASSES`（Boot 2.x 是 `javax.servlet.Servlet`，3.x 是 `jakarta.servlet.Servlet`，加上 `org.springframework.web.context.ConfigurableWebApplicationContext`），两个都在 → `SERVLET`，缺任意一个 → `NONE`。结果存在 `webApplicationType` 字段，可用 `spring.main.web-application-type` 或 `SpringApplication#setWebApplicationType` 强制覆盖。
 2. `setInitializers(getSpringFactoriesInstances(ApplicationContextInitializer.class))`。
 3. `setListeners(getSpringFactoriesInstances(ApplicationListener.class))`。
 4. `deduceMainApplicationClass()` 通过构造栈找到 `main` 方法所在类，仅用于日志与 banner。
@@ -1006,13 +1012,13 @@ flowchart TD
 
 ### 11.1 端点与暴露
 
-引入 `spring-boot-starter-actuator` 后，端点通过 `management.endpoints.web.exposure.include` 控制暴露。**默认暴露面很小**：`spring-boot-actuator-autoconfigure-2.0.3.RELEASE.jar` 的元数据里该属性默认值是 `health,info`，后续版本进一步收紧。JMX 侧 `management.endpoints.jmx.exposure.include` 默认是 `*`。**生产上不要依赖默认值，显式声明**——默认口径在不同版本间变过，只有写死才可控。
+引入 `spring-boot-starter-actuator` 后，端点通过 `management.endpoints.web.exposure.include` 控制暴露。**默认暴露面很小**：`spring-boot-actuator-autoconfigure-2.0.3.RELEASE.jar` 的元数据里该属性默认值是 `health,info`，后续版本进一步收紧（实测 2.5.12 与 3.5.6 都只剩 `health`）。JMX 侧 `management.endpoints.jmx.exposure.include` 在 2.x 默认是 `*`（全暴露），实测 3.3.13 起已收窄为 `health`。**生产上不要依赖默认值，显式声明**——默认口径在不同版本间变过，只有写死才可控。
 
 | 属性 | 默认值 | 说明 |
 | --- | --- | --- |
 | `management.endpoints.web.base-path` | `/actuator` | 基础路径 |
 | `management.endpoints.web.exposure.include` | 极小 | 建议显式写 `health,info,metrics,prometheus` |
-| `management.endpoints.jmx.exposure.include` | `*` | JMX 侧暴露全部 |
+| `management.endpoints.jmx.exposure.include` | 2.x 为 `*`，3.3 起收窄为 `health` | JMX 侧暴露面，3.x 不再全开 |
 | `management.server.port` | 无 | 设为独立端口可与业务端口隔离 |
 | `management.endpoint.shutdown.enabled` | `false` | 必须显式开启，且只接受 POST |
 | `management.endpoint.health.show-details` | `never` | 可选 `always`、`when-authorized`、`never` |
@@ -1090,7 +1096,7 @@ management:
 ```
 
 - `percentiles-histogram` 打开后才会输出 `http_server_requests_seconds_bucket`，Prometheus 才能算 P99。**不开这个，你在 Grafana 上画不出分位数**。
-- 上面的 `slo` 是 Boot 3.0 起的属性名，2.x 里叫 `sla`（`spring-boot-actuator-autoconfigure-2.0.3.RELEASE.jar` 的元数据里是 `management.metrics.distribution.sla`），迁移时不要漏改。
+- 上面的 `slo` 不是 Boot 3.0 才有的：实测 `spring-boot-actuator-autoconfigure-2.5.12.jar` 里已经是 `management.metrics.distribution.slo`（配 `ServiceLevelObjectiveBoundary`），更早的 2.x（如 2.0.3）才叫 `sla`，从老项目迁移时不要漏改。
 - 默认 `http.server.requests` 的 URI 维度会为每个路径建一个时间序列，动态路径多时会**打爆时间序列基数**。控制手段：`management.metrics.web.server.max-uri-tags`（默认 100）与 `MeterFilter` 重写 URI。
 - Boot 3.x 用 `@Observed`（`io.micrometer.observation.annotation.Observed`）替代 `@Timed`，配套 `ObservationRegistry`；链路追踪用 Micrometer Tracing，`management.tracing.sampling.probability` 默认 `0.1`。
 
@@ -1131,12 +1137,14 @@ spring:
 
 优雅停机靠两个 `SmartLifecycle` 协作，相位值决定了停止顺序：
 
-| Bean | 相位 | 停止时机 |
-| --- | --- | --- |
-| `WebServerGracefulShutdownLifecycle`（`org.springframework.boot.web.context`） | `Integer.MAX_VALUE` = 2147483647 | 最先停 |
-| `WebServerStartStopLifecycle`（`org.springframework.boot.web.servlet.context`） | `Integer.MAX_VALUE - 1` = 2147483646 | 其次停 |
+| Bean | 相位（2.5.12 / 2.7.18 实测） | 相位（3.3.13 / 3.5.6 实测） | 停止时机 |
+| --- | --- | --- | --- |
+| `WebServerGracefulShutdownLifecycle`（`org.springframework.boot.web.context`） | `Integer.MAX_VALUE` = 2147483647 | `SmartLifecycle.DEFAULT_PHASE - 1024` = 2147482623 | 最先停 |
+| `WebServerStartStopLifecycle`（`org.springframework.boot.web.servlet.context`） | `Integer.MAX_VALUE - 1` = 2147483646 | 上面再 `- 1024` = 2147482622 | 其次停 |
 
-`DefaultLifecycleProcessor#stopBeans` 按相位**倒序**停止，所以相位最大的 `WebServerGracefulShutdownLifecycle` 先执行：它把容器标记为 `REFUSING_TRAFFIC`，然后调用 `WebServer#shutDownGracefully`——Tomcat 侧由 `org.springframework.boot.web.embedded.tomcat.GracefulShutdown` 实现，内部对每个 `Connector` 调 `pause()` 再 `close()`，等待在途请求结束或超时。等它停完，`WebServerStartStopLifecycle` 才真正 `stop()` 掉容器。
+**相位值在 3.x 被整体下调过**（源码改成基于 `WebServerGracefulShutdownLifecycle.SMART_LIFECYCLE_PHASE` 计算），答题时只要说清"前者的相位永远比后者大（2.x 差 1，3.x 差 1024）、倒序停止所以先暂停连接器"就不会错，别硬背 `MAX_VALUE`。
+
+`DefaultLifecycleProcessor#stopBeans` 按相位**倒序**停止，所以相位最大的 `WebServerGracefulShutdownLifecycle` 先执行：它调用 `WebServer#shutDownGracefully`——Tomcat 侧由 `org.springframework.boot.web.embedded.tomcat.GracefulShutdown` 实现，内部对每个 `Connector` 调 `pause()` 再 `closeServerSocketGraceful()`，等待在途请求结束或超时。等它停完，`WebServerStartStopLifecycle` 才真正 `stop()` 掉容器。注意 `ReadinessState.REFUSING_TRAFFIC` 不是这个 lifecycle 发的，而是 `ServletWebServerApplicationContext#doClose()` 在触发这套生命周期之前就发布了，所以 readiness 会比连接器暂停更早变成 503。
 
 `GracefulShutdownResult`（`org.springframework.boot.web.server`）有三个枚举值：`REQUESTS_ACTIVE`、`IDLE`、`IMMEDIATE`，用于日志与判断是否超时。
 
@@ -1196,7 +1204,7 @@ stateDiagram-v2
 
 ### 13.1 依赖与日志系统选择
 
-`spring-boot-starter-logging` 包含 `logback-classic`、`log4j-to-slf4j`（把 Log4j2 API 桥接到 SLF4J）、`jul-to-slf4j`（把 JUL 桥接过来）。日志系统的选择由 `LoggingSystemFactory` SPI 决定，`spring.factories` 中的顺序是：
+`spring-boot-starter-logging` 包含 `logback-classic`、`log4j-to-slf4j`（把 Log4j2 API 桥接到 SLF4J）、`jul-to-slf4j`（把 JUL 桥接过来）。日志系统的选择由 `LoggingSystemFactory` SPI 决定，3.x 的 `spring.factories` 长这样——**注意文件里的行序不代表优先级**：
 
 ```
 org.springframework.boot.logging.LoggingSystemFactory=\
@@ -1204,6 +1212,8 @@ org.springframework.boot.logging.java.JavaLoggingSystem$Factory,\
 org.springframework.boot.logging.log4j2.Log4J2LoggingSystem$Factory,\
 org.springframework.boot.logging.logback.LogbackLoggingSystem$Factory
 ```
+
+真正决定顺位的是三个嵌套 `Factory` 上的 `@Order`：`SpringFactoriesLoader#loadFactories` 拿到列表后会做 `AnnotationAwareOrderComparator.sort`，再取第一个返回非 null 的实现。Logback 是 `Ordered.HIGHEST_PRECEDENCE + 1024`、Log4j2 是 `0`、Java 是 `Ordered.LOWEST_PRECEDENCE - 1024`，所以类路径上有 Logback 就用 Logback。2.5.12 的 `spring.factories` 里这三行的顺序正好相反（Logback 在最前），**别按文件顺序去背**。
 
 **换成 Log4j2**：排除 `spring-boot-starter-logging`，引入 `spring-boot-starter-log4j2`。注意 `log4j-to-slf4j` 与 `log4j-slf4j-impl` 不能同时存在，否则会形成桥接环。
 
@@ -1577,7 +1587,7 @@ class MyDtoConfig { }
 **答题框架（30 秒版）**：`AutoConfigurationImportSelector#getAutoConfigurationEntry` 负责收集候选类，做去重、排除、条件过滤、排序，然后交给 `ConfigurationClassPostProcessor` 注册。2.6 及以前候选来自 `META-INF/spring.factories` 的 `EnableAutoConfiguration` 键；2.7 起改为 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports`，通过 `ImportCandidates` 读取；3.0 起彻底不再读 `spring.factories` 的自动配置键。
 
 **展开（2 分钟版）**：
-1. 候选来源：2.5.12 的 `spring.factories` 里有 132 个类；3.5.6 的 `.imports` 文件有 156 行。
+1. 候选来源：2.5.12 的 `spring.factories` 里有 131 个类；3.5.6 的 `.imports` 文件有 156 行。
 2. 去重与排除：`removeDuplicates` 用 `LinkedHashSet`；`getExclusions` 合并注解 `exclude`/`excludeName` 与属性 `spring.autoconfigure.exclude`；`checkExcludedClasses` 会在排除一个不存在的类时直接报错，避免拼错类名静默失效。
 3. 条件过滤：`getAutoConfigurationImportFilters()` 加载三个内置 `AutoConfigurationImportFilter`——`OnClassCondition`、`OnBeanCondition`、`OnWebApplicationCondition`，每个返回与候选数组等长的 `boolean[]`，不匹配的位置被置空后压紧。真正的性能来源是 `spring-autoconfigure-metadata.properties` 预索引与 `OnClassCondition` 的按类名分组批量判断。
 4. 排序：`AutoConfigurationSorter` 按 `@AutoConfigureOrder`、`@AutoConfigureBefore/After`、类名字母序。
@@ -1628,7 +1638,7 @@ class MyDtoConfig { }
 **答题框架（30 秒版）**：`ServletWebServerApplicationContext#onRefresh` 调 `createWebServer()`，从容器里取唯一的 `ServletWebServerFactory`（由 `ServletWebServerFactoryAutoConfiguration` 的三个嵌套配置类按类路径条件选择），调用 `getWebServer(...)` 得到 `WebServer`，再包装成 `WebServerStartStopLifecycle` 注册。换 Undertow 要排除 `spring-boot-starter-tomcat` 再加 `spring-boot-starter-undertow`。
 
 **展开（2 分钟版）**：
-1. `EmbeddedTomcat` 条件：`Servlet`、`Tomcat`、`UpgradeProtocol` 都在类路径；`EmbeddedJetty` 条件：`Servlet`、`Server`、`Loader`；`EmbeddedUndertow` 条件：`Servlet`、`Undertow`。Tomcat 的判断在最前，所以不排除就换不掉。
+1. `EmbeddedTomcat` 条件：`Servlet`、`Tomcat`、`UpgradeProtocol` 都在类路径；`EmbeddedJetty` 条件：`Servlet`、`Server`、`Loader`、`WebAppContext`；`EmbeddedUndertow` 条件：`Servlet`、`Undertow`、`SslClientAuthMode`。三者互斥靠 `@ConditionalOnMissingBean(ServletWebServerFactory)`，按 `@Import` 顺序（Tomcat → Jetty → Undertow）求值，所以 Tomcat 类还在类路径上就先命中，不排除就换不掉。
 2. 默认协议实测是 `org.apache.coyote.http11.Http11NioProtocol`。
 3. 定制走 `WebServerFactoryCustomizer`：`WebServerFactoryCustomizerBeanPostProcessor` 先排序再依次 `customize`。Boot 自带的 `ServletWebServerFactoryCustomizer`、`TomcatWebServerFactoryCustomizer`、`UndertowWebServerFactoryCustomizer` 的 `getOrder()` 实测都是 `0`，所以自定义 customizer 的 order 必须大于 0 才能覆盖它们。
 4. Undertow 线程：`server.undertow.threads.io` 与 `threads.worker` 都不设时用 Undertow `Builder` 默认（io 为 `max(availableProcessors, 2)`，worker 为 `io * 8`）。
@@ -1641,7 +1651,7 @@ class MyDtoConfig { }
 **答题框架（30 秒版）**：构造阶段 `deduceFromClasspath` 推断 Web 类型并加载 initializers 与 listeners；`run` 里依次是 `configureHeadlessProperty` → `getRunListeners` → `starting` → `prepareEnvironment` → `printBanner` → `createApplicationContext` → `prepareContext` → `refreshContext` → `afterRefresh` → `callRunners` → `running`。事件顺序是 `ApplicationStartingEvent` → `ApplicationEnvironmentPreparedEvent` → `ApplicationContextInitializedEvent` → `ApplicationPreparedEvent` → `ContextRefreshedEvent` → `ApplicationStartedEvent` → `ApplicationReadyEvent`，失败则 `ApplicationFailedEvent`。
 
 **展开（2 分钟版）**：
-1. `deduceFromClasspath` 的判定：有 `DispatcherHandler` 且没有 Servlet 相关类 → `REACTIVE`；有 Servlet 相关类 → `SERVLET`；否则 `NONE`。可用 `spring.main.web-application-type` 强制。
+1. `deduceFromClasspath` 的判定：有 `DispatcherHandler` 且没有 `DispatcherServlet` 与 Jersey 的 `ServletContainer` → `REACTIVE`；`Servlet` 与 `ConfigurableWebApplicationContext` 都在 → `SERVLET`；缺任意一个 → `NONE`。可用 `spring.main.web-application-type` 强制。
 2. `createApplicationContext` 反射实例化：`AnnotationConfigServletWebServerApplicationContext`、`AnnotationConfigReactiveWebServerApplicationContext` 或 `AnnotationConfigApplicationContext`。
 3. `refreshContext` 调用 `AbstractApplicationContext#refresh()`，内嵌容器在 `onRefresh` 里启动。
 4. `callRunners` 执行 `ApplicationRunner`（参数是 `ApplicationArguments`）与 `CommandLineRunner`（参数是 `String[]`），可用 `@Order` 排序。
@@ -1655,7 +1665,7 @@ class MyDtoConfig { }
 
 **展开（2 分钟版）**：
 1. **确认停机方式**：`server.shutdown=immediate` 时容器直接关闭，在途请求被切断，必然 502。
-2. **确认相位**：`WebServerGracefulShutdownLifecycle` 相位是 `Integer.MAX_VALUE`，`WebServerStartStopLifecycle` 是 `Integer.MAX_VALUE - 1`，`DefaultLifecycleProcessor#stopBeans` 倒序停止，所以先暂停连接器再关容器。这是正确顺序的保证。
+2. **确认相位**：`WebServerGracefulShutdownLifecycle` 的相位总是比 `WebServerStartStopLifecycle` 大（2.x 是 `Integer.MAX_VALUE` 与 `MAX_VALUE - 1`，差 1；3.3.13 起整体下调为 `SmartLifecycle.DEFAULT_PHASE - 1024` 与再减 1024，差 1024），`DefaultLifecycleProcessor#stopBeans` 倒序停止，所以先暂停连接器再关容器。这是正确顺序的保证。
 3. **确认 K8s 时序**：摘 Endpoints 与发 `SIGTERM` 并行，网关路由更新有延迟。`preStop` 加 `sleep 5` 是必要的，`terminationGracePeriodSeconds` 必须大于 `preStop sleep + timeout-per-shutdown-phase`（例如 5 + 30 = 35，配 45）。
 4. **确认异步任务**：`spring.task.execution.shutdown.await-termination` 默认 `false`，`@Async` 任务不受 Web 容器保护，必须显式打开并设 `await-termination-period`。
 5. **看日志**：`GracefulShutdownResult` 会区分正常完成与超时；如果日志显示超时，说明 30 秒不够，要么调大超时，要么排查慢请求。
@@ -1723,7 +1733,7 @@ class MyDtoConfig { }
 | `@ConditionalOnMissingBean` 写在业务 `@Configuration` 里也行 | 只在自动配置类里安全，业务配置类之间顺序不确定 |
 | `@Value` 和 `@ConfigurationProperties` 可以互相替代 | `@ConfigurationProperties` 不支持 SpEL；`@Value` 不支持松散绑定与校验 |
 | `@Component` 加在属性类上就能生效 | 属性类所在包通常不在用户扫描范围内，必须 `@EnableConfigurationProperties` |
-| 只加 Undertow 依赖就能换容器 | 必须排除 `spring-boot-starter-tomcat`，否则 `EmbeddedTomcat` 条件先命中 |
+| 只加 Undertow 依赖就能换容器 | 必须排除 `spring-boot-starter-tomcat`，否则 `EmbeddedTomcat` 先注册了 `ServletWebServerFactory`，后两个嵌套类因 `@ConditionalOnMissingBean` 退让 |
 | `server.shutdown` 一直是 `immediate` | 3.4 起默认改为 `graceful` |
 | 优雅停机保护所有异步任务 | `@Async` 任务不在 Web 容器保护范围内，要配 `spring.task.execution.shutdown.await-termination=true` |
 | `logging.logback.rollingpolicy.max-history` 配了就安全 | `total-size-cap` 默认 `0B` 不限总量，磁盘仍可能被打满 |
@@ -1752,7 +1762,7 @@ class MyDtoConfig { }
 - Boot 自带的三个 `WebServerFactoryCustomizer` 的 `getOrder()` 都是 `0`，自定义的要 order 大于 0 才能覆盖。
 - Tomcat 默认 `threads.max=200`、`min-spare=10`、`max-connections=8192`、`accept-count=100`、`max-http-form-post-size=2MB`。
 - `server.port` 默认 `8080`，`server.shutdown` 在 3.4 起默认 `graceful`，`spring.lifecycle.timeout-per-shutdown-phase` 默认 `30s`。
-- 停机相位：`WebServerGracefulShutdownLifecycle` 是 `MAX_VALUE`，`WebServerStartStopLifecycle` 是 `MAX_VALUE - 1`，倒序停止。
+- 停机相位：`WebServerGracefulShutdownLifecycle` 总是比 `WebServerStartStopLifecycle` 大（2.x 是 `MAX_VALUE` 与 `MAX_VALUE - 1`，差 1；3.3.13 起是 `SmartLifecycle.DEFAULT_PHASE - 1024` 与再减 1024，差 1024），倒序停止。
 - `spring.main.allow-bean-definition-overriding` 默认 `false`；`spring.main.allow-circular-references` 2.6 起默认 `false`。
 - `logging.logback.rollingpolicy.max-file-size=10MB`、`max-history=7`、`total-size-cap=0B`、`clean-history-on-start=false`。
 - `AsyncAppender` 的 `queueSize` 默认 256，`discardingThreshold` 默认 `queueSize/5`。

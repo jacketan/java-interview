@@ -173,6 +173,8 @@ flowchart TD
 
 **面试要点**：半同步不是"多数派"，默认只需 1 个从库 ACK 就返回；超时会静默降级；`AFTER_SYNC` 才真正解决主从切换丢数据。生产上必须给 `rpl_semi_sync_master_status`（8.0.26 起 `rpl_semi_sync_source_status`）做监控，值变为 `OFF` 就说明已在异步模式。
 
+**生产现象**：从库宕机或网络抖动时，主库的写请求会被阻塞最长一个 `rpl_semi_sync_master_timeout`（默认 10s）才降级返回，业务侧表现为写 RT 出现 10 秒级尖刺、连接池被迅速打满——这是半同步最常见的线上故障形态。所以生产上通常把 timeout 调小（如 1000ms），宁可更快降级到异步，也不要把写请求拖住 10 秒。
+
 ### 3.3 组复制 MGR
 
 MGR（MySQL Group Replication）5.7.17 起 GA，基于 Paxos 变种（XCom）实现。要点：
@@ -193,13 +195,13 @@ MGR（MySQL Group Replication）5.7.17 起 GA，基于 Paxos 变种（XCom）实
 | 主库写入并发度高于从库单线程回放能力 | SQL 线程 100% 利用仍追不上 | `SHOW PROCESSLIST` 看 SQL 线程一直 `executing`；`SHOW REPLICA STATUS` 的 `Seconds_Behind_Master` 持续增长 |
 | 大事务 | 一个事务回放 30 秒，期间 `relay_log` 堆积 | binlog 里有超大事务，`SHOW BINLOG EVENTS` 单个 event 巨大 |
 | DDL 与锁 | 从库上执行 `ALTER TABLE` 阻塞 SQL 线程 | 从库有长查询阻塞回放 |
-| 网络与 IO 线程 | IO 线程落后，relay log 拉不过来 | `SHOW REPLICA STATUS` 的 `Master_Log_File` 与 `Relay_Master_Log_File` 差距大，但 SQL 线程已追平 |
+| 网络与 IO 线程 | IO 线程落后，relay log 拉不过来 | 主库 `SHOW MASTER STATUS` 的 `File`/`Position` 与从库 `Master_Log_File`/`Read_Master_Log_Pos` 差距大，而 `Relay_Master_Log_File`/`Exec_Master_Log_Pos` 已与后者一致（说明 relay log 已回放完） |
 
 ### 4.2 `Seconds_Behind_Master` 是个坑，别信它
 
 `Seconds_Behind_Master`（SBM）的计算方式：SQL 线程当前执行 event 的时间戳与从库当前时间的差。三种情况它都会失真：
 
-1. **IO 线程延迟时 SBM 可能显示 0**：SQL 线程把已收到的老 relay log 执行完，event 时间戳很老，但差值算的是 event 时间戳与"从库当时时间"，可能恰好很小。真正准确的是比较 `Master_Log_File`/`Read_Master_Log_Pos` 与 `Relay_Master_Log_File`/`Exec_Master_Log_Pos`。
+1. **IO 线程延迟时 SBM 可能显示 0**：SBM 只衡量 SQL 线程在已收到 relay log 内的进度，relay log 一被消费完它就报 0，根本不知道主库还有多少没传过来，此时从库可能落后主库很多。判断真实落后量，要拿主库 `SHOW MASTER STATUS` 的 `File`/`Position` 与从库的 `Master_Log_File`/`Read_Master_Log_Pos` 比；只有判断 SQL 线程自身是否落后，才比 `Master_Log_File`/`Read_Master_Log_Pos` 与 `Relay_Master_Log_File`/`Exec_Master_Log_Pos`。
 2. **SQL 线程停止时 SBM 为 NULL**（IO 线程停止同样为 NULL）。
 3. **主库长时间空写**：SBM 无参考意义。
 
@@ -237,7 +239,7 @@ MySQL 8.0 还可以用 `performance_schema.replication_applier_status_by_worker`
 
 ```mermaid
 flowchart TD
-  A["主库同一时间窗口内的多个事务"] --> B{"依赖序列依赖 tracking 模式"}
+  A["主库同一时间窗口内的多个事务"] --> B{"binlog_transaction_dependency_tracking 模式"}
   B -->|"COMMIT_ORDER"| C["只把同一组提交内的事务标记为可并行"]
   B -->|"WRITESET"| D["用 XXHASH64 计算事务写集合"]
   D --> E{"两个事务的 writeset 是否有交集"}
@@ -268,7 +270,7 @@ flowchart TD
 
 `HintManager.setPrimaryRouteOnly()` 在 ShardingSphere-JDBC 5.x 中生效范围是当前线程，必须在 finally 里 `hintManager.close()`，否则 ThreadLocal 泄漏会污染线程池里的后续请求——这是线上事故的常见原因。
 
-Spring 侧的常见实现是 `AbstractRoutingDataSource` + `@Transactional(readOnly = true)`，用 AOP 根据方法上的注解或 `TransactionSynchronizationManager.isCurrentTransactionReadOnly()` 决定数据源。**注意 `@Transactional(readOnly = true)` 只有走到主库才有意义**，如果 @Transactional 未生效（同类内部调用、private 方法、异常被 catch），读写分离会直接失效。
+Spring 侧的常见实现是 `AbstractRoutingDataSource` + `@Transactional(readOnly = true)`，用 AOP 根据方法上的注解或 `TransactionSynchronizationManager.isCurrentTransactionReadOnly()` 决定数据源。**注意 `@Transactional(readOnly = true)` 只有在事务代理真正生效时才读得到**，如果 @Transactional 未生效（同类内部调用、private 方法、方法被 `final` 修饰），`isCurrentTransactionReadOnly()` 恒为 false，读请求会全部打到主库，读写分离直接失效。
 
 ### 4.5 延迟排查决策树
 
@@ -279,9 +281,9 @@ flowchart TD
   C -->|"No"| D["看 Last_SQL_Error 与 Last_SQL_Errno"]
   D --> D1["1062 主键冲突 多为位点回退或双写导致"]
   D --> D2["1032 找不到行 从库数据被误删或人为改过"]
-  C -->|"Yes"| E{"Master_Log_File 与 Relay_Master_Log_File 差距"}
-  E -->|"差距大 说明 IO 线程落后"| F["查网络 带宽 主库 dump 线程是否阻塞"]
-  E -->|"差距小 说明 SQL 线程落后"| G["查从库慢查询 大事务 DDL 锁等待"]
+  C -->|"Yes"| E{"Master_Log_File 与 Relay_Master_Log_File 是否一致"}
+  E -->|"不一致 说明 SQL 线程落后"| G["查从库慢查询 大事务 DDL 锁等待"]
+  E -->|"一致 说明 SQL 已回放完 再与主库位点比 有差距即 IO 线程落后"| F["查网络 带宽 主库 dump 线程是否阻塞"]
   G --> H["SHOW PROCESSLIST 看 SQL 线程状态与耗时"]
   G --> I["performance_schema.replication_applier_status_by_worker"]
   H --> J{"是否单线程回放"}
@@ -392,6 +394,8 @@ START REPLICA SQL_THREAD;
 
 `pt-table-checksum` 的注意事项：默认会对大表加锁或产生高负载，要用 `--chunk-size`、`--max-load`、`--set-vars`（如 `innodb_lock_wait_timeout=1`）限制影响；从库不是主库的下级（比如已经切换过）时会算出假差异。
 
+MySQL 自带的**延迟复制**比 `pt-slave-delay` 更省事：`CHANGE REPLICATION SOURCE TO SOURCE_DELAY=N`（8.0.23 之前的写法是 `MASTER_DELAY`，单位秒），从库会稳定落后主库至少 N 秒。典型做法是专门留一个延迟 1 小时的从库，误删或 `DROP TABLE` 之后还有窗口期把数据捞回来。
+
 ## 七、分库分表的时机与拆分维度
 
 ### 7.1 什么时候才该分
@@ -399,7 +403,7 @@ START REPLICA SQL_THREAD;
 分库分表是**有明确代价的最后手段**。判断顺序应该是：
 
 1. **先优化**：加索引、去掉全表扫描、消灭 N+1 查询、加缓存（Redis）、加读写分离、归档冷数据。这些能解决 80% 的"数据库慢"。
-2. **再看单表容量**：InnoDB B+ 树三层大约能装多少行？非叶子节点每页存约 1000 个指针（16KB 页 / 约 14 字节的"主键 + 页号"），三层即约 10^6 个叶子页；叶子页能装多少行取决于行宽。行宽 1KB 时每页约 15 行，合计约 1500 万行；行宽 200 字节时每页约 80 行，合计约 8000 万行。所以**"2000 万行"不是魔法数字，而是"行宽 1KB、主键 bigint"下的经验分界线**。
+2. <strong>再看单表容量</strong>：InnoDB B+ 树三层大约能装多少行？非叶子节点每页存约 1000 个指针（16KB 页 / 约 14 字节的"主键 + 页号"），三层即约 10^6 个叶子页；叶子页能装多少行取决于行宽。行宽 1KB 时每页约 15 行，合计约 1500 万行；行宽 200 字节时每页约 80 行，合计约 8000 万行。所以<strong>"2000 万行"不是魔法数字，而是"行宽 1KB、主键 bigint"下的经验分界线</strong>。
 3. **再看写入能力**：单机 MySQL 写入（`sync_binlog=1` + `innodb_flush_log_at_trx_commit=1`）在普通 SSD 上大约几千 TPS，NVMe 上能到上万，但加上索引维护与从库放大后，稳定值通常在 **几千 TPS**。当写入持续超过这个数值，才考虑分库。
 4. **能用 NewSQL 就别手写分片**：TiDB、OceanBase、PolarDB-X 对业务透明，代价是运维体系与延迟特性变化。
 
@@ -509,7 +513,7 @@ ShardingSphere 5.0 起配置从 4.x 的 `sharding.jdbc.config.sharding.tables.xx
 | 雪花算法 Snowflake | 64 位（`long`） | 趋势递增（按毫秒） | 本地生成，极高 | 需要 workerId | 时钟回拨；workerId 管理 |
 | Redis `INCR`/`INCRBY` | 64 位 | 严格递增 | 高 | Redis | 依赖 Redis 可用性；集群下要用 hash tag 保证同一 slot |
 
-`UUID.randomUUID()` 是 version 4（随机），`UUID.nameUUIDFromBytes` 是 version 3（MD5，确定性）。JDK 没有内置 RFC 9562 的 UUIDv7（时间有序）实现，想要有序 UUID 只能引第三方库或自己拼。另外 Java 的 `UUID#compareTo` 是**有符号 long 比较**，所以 `UUID.toString()` 的字典序**不等于**字节序——用 UUID 排序不能靠字符串比较。
+`UUID.randomUUID()` 是 version 4（随机），`UUID.nameUUIDFromBytes` 是 version 3（MD5，确定性）。JDK 没有内置 RFC 9562 的 UUIDv7（时间有序）实现，想要有序 UUID 只能引第三方库或自己拼。另外 Java 的 `UUID#compareTo` 是**有符号 long 比较**，而 `UUID.toString()` 的字典序是无符号位序，两者顺序不一致——同一批 UUID 在 Java 里排序、在 MySQL 里按字符串排序，结果可能不同。
 
 ### 9.3 雪花算法的位分配与时钟回拨
 
@@ -641,7 +645,7 @@ ShardingSphere 的归并引擎有三类：**流式归并**（`StreamMergedResult
 
 ### 11.1 先问：事务真的跨分片了吗
 
-分片后事务的正确设计原则是**"让事务落在单分片内"**：
+分片后事务的正确设计原则是<strong>"让事务落在单分片内"</strong>：
 
 - 按 `user_id` 分片时，把"用户 + 用户资产 + 用户订单"都按 `user_id` 分片，则单用户的操作天然是单库事务；
 - 只有"跨用户"的操作（转账、库存扣减与订单创建）才真正需要分布式事务。
@@ -655,7 +659,7 @@ ShardingSphere 的归并引擎有三类：**流式归并**（`StreamMergedResult
 | 2PC / XA | 强一致 | 低（数据库层） | 差，prepare 后持锁到 commit | 内部系统、低并发、短事务 | 同步阻塞、协调者单点、`XA RECOVER` 悬挂事务需人工处理 |
 | TCC | 最终一致（业务补偿） | 高，要写 Try/Confirm/Cancel 三个接口 | 好 | 资金、库存等核心链路 | 空回滚、悬挂、幂等三座大山 |
 | 本地消息表 | 最终一致 | 中 | 好 | 异步、可容忍延迟（发货、通知） | 需要定时任务与对账，消息表本身在业务库 |
-| Seata AT | 最终一致（默认读已提交级） | 低，加注解即可 | 中（全局锁竞争） | 快速接入的通用场景 | 全局锁、脏写检测失败需人工、跨分片后 RM 数量放大 |
+| Seata AT | 最终一致（全局隔离级别默认**读未提交**） | 低，加注解即可 | 中（全局锁竞争） | 快速接入的通用场景 | 全局锁、脏写检测失败需人工、跨分片后 RM 数量放大 |
 | 事务消息（RocketMQ） | 最终一致 | 低 | 好 | 已有 MQ 的异步链路 | 依赖 MQ 的事务消息能力 |
 | 最大努力通知 | 最终一致 | 低 | 最好 | 对账、回调通知 | 不保证成功，必须对账 |
 
@@ -745,7 +749,7 @@ sequenceDiagram
 
 ### 12.1 为什么扩容这么难
 
-哈希取模路由下，分片数从 4 变成 8，几乎**所有**数据的分片归属都变了（`hash % 4 != hash % 8`），要迁移约一半到四分之三的数据。所以：
+哈希取模路由下，分片数从 4 变成 8，`hash % 8` 与 `hash % 4` 只有一半情况结果相同，即**约一半数据要迁移**（如果新旧分片数不是整数倍关系，几乎全部数据都要迁移）。所以：
 
 - **一开始就分够**（如一次分 64 片，先放在 4 个实例上，后续把表搬到新实例即可）。ShardingSphere 支持"逻辑分片数不变、物理数据源增加"，扩容时用 `ShardingSphere-Scaling` 或 `ShardingSphere-Proxy` 的迁移能力搬表，业务 SQL 不用改。
 - **用范围/时间分片**，扩容只需新增区间，老数据不动。
@@ -957,8 +961,8 @@ flowchart LR
 **答题框架（30 秒版）**：先看 `SHOW REPLICA STATUS` 的四个位点列，区分是 IO 线程落后还是 SQL 线程落后；延迟度量别信 `Seconds_Behind_Master`，用 `pt-heartbeat`。优化分四层：并行复制（`replica_parallel_workers` + `LOGICAL_CLOCK`/`WRITESET`）、拆大事务、从库减少额外开销（关 `log_replica_updates`、`innodb_flush_log_at_trx_commit=2`）、业务层读己之写兜底。
 
 **展开（2 分钟版）**：
-1. 判断依据：`Master_Log_File`/`Relay_Master_Log_File` 差距大说明 IO 线程慢；这两个文件相同但 `Read_Master_Log_Pos` 与 `Exec_Master_Log_Pos` 差距大说明 SQL 线程慢。
-2. WRTESET 需要 `binlog_transaction_dependency_tracking=WRITESET` + `transaction_write_set_extraction=XXHASH64`（默认）配合，主库设置，从库受益。
+1. 判断依据：`Master_Log_File`/`Read_Master_Log_Pos`（IO 线程已拉到哪）与 `Relay_Master_Log_File`/`Exec_Master_Log_Pos`（SQL 线程已回放到哪）差距大说明 SQL 线程慢；两者一致但与主库 `SHOW MASTER STATUS` 的 `File`/`Position` 有差距说明 IO 线程慢。
+2. WRITESET 需要 `binlog_transaction_dependency_tracking=WRITESET` + `transaction_write_set_extraction=XXHASH64`（默认）配合，主库设置，从库受益。
 3. `replica_preserve_commit_order=ON` 保证主从切换安全，MGR 强制要求。
 4. 业务层：`HintManager.setPrimaryRouteOnly()`、`WAIT_FOR_EXECUTED_GTID_SET`、用户维度 sticky。
 
@@ -989,7 +993,7 @@ flowchart LR
 
 ### Q7. 分片键怎么选？如果业务有两种查询维度怎么办？
 
-**答题框架（30 秒版）**：分片键要满足高基数、分布均匀、覆盖多数查询、不可变、路由可计算五条。两种查询维度的标准解法是**基因法**：把分片键的哈希低位编码进业务 ID 的高位/低位，使得第二维度也能直接路由。典型例子是订单按 `user_id` 分片，同时把 `user_id` 的低 4 位拼进 `order_id`，这样按 `order_id` 也能算出分片。
+**答题框架（30 秒版）**：分片键要满足高基数、分布均匀、覆盖多数查询、不可变、路由可计算五条。两种查询维度的标准解法是**基因法**：把分片键哈希值的低 K 位编码进业务 ID 的低 K 位（这样才能用 `order_id % 分片数` 直接路由），使得第二维度也能直接路由。典型例子是订单按 `user_id` 分片，同时把 `user_id` 的低 4 位拼进 `order_id`，这样按 `order_id` 也能算出分片。
 
 **展开（2 分钟版）**：
 1. 基因法的代价：ID 结构被改造，需要自定义发号器；基因位数的选择要等于分片数的位数（16 片用 4 位）。
@@ -1075,7 +1079,7 @@ flowchart LR
 | "分库分表能解决单实例写入瓶颈" | 只水平分表不分库，单实例 IO/CPU/连接数瓶颈仍在 |
 | "单表 2000 万行是硬性红线" | 它是"行宽 1KB、主键 bigint"下的经验值，行宽小可到几千万行，行宽大可能几百万行就慢 |
 | "分片键可以更新" | 更新分片键等于跨分片搬迁数据，必须选不可变字段 |
-| "UUID 做主键只是占空间" | 随机主键导致 B+ 树频繁页分裂与随机 IO，写入性能显著下降；且 `UUID#compareTo` 有符号比较，字符串字典序不等于字节序 |
+| "UUID 做主键只是占空间" | 随机主键导致 B+ 树频繁页分裂与随机 IO，写入性能显著下降；且 `UUID#compareTo` 按有符号 long 比较，与字符串（无符号位序）的排序结果不一致 |
 | "雪花算法只能等时钟回拨过去" | 还有抛异常、借用序列号备用位、外部协调（Leaf-snowflake 用 ZK 记录 workerId 与时间戳） |
 | "号段模式每次发号都要查库" | 一次取一个号段（step 通常 1000~100000）在本地内存发号，靠双 buffer 在水位线前异步预取 |
 | "跨分片 `UNIQUE` 还能用" | 数据库无法跨分片保证唯一，必须靠分片键设计、Redis、独立校验表或对账 |
