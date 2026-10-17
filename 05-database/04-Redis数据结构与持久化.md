@@ -13,7 +13,8 @@
 - [五、RDB 与 AOF 持久化](#五rdb-与-aof-持久化)
 - [六、大 key、热 key、内存碎片与批量操作](#六大-key热-key内存碎片与批量操作)
 - [七、慢查询日志与 latency monitor](#七慢查询日志与-latency-monitor)
-- [八、高级岗三问](#八高级岗三问)
+- [八、Java 客户端实战](#八java-客户端实战)
+- [九、高级岗三问](#九高级岗三问)
 - [高频面试题](#高频面试题)
 - [易错点与踩坑](#易错点与踩坑)
 - [一句话速记](#一句话速记)
@@ -1057,9 +1058,148 @@ flowchart TD
 - **Lettuce**：基于 Netty，默认共享单个连接（`RedisClient` 是线程安全的），命令超时 `RedisURI` 的 `timeout` / `RedisClientOptions` 的 `timeoutOptions`（默认 60 秒）。Lettuce 是异步非阻塞模型，**pipeline 与命令超时行为与 Jedis 完全不同**，排查时要看 `RedisCommandTimeoutException`。
 - **`redis-py`/`jedis` 的 pipeline 与事务**：`jedis.pipelined()` 返回 `Pipeline`，`sync()` 收结果；`MultiKeyPipelineBase` 保证同 slot。
 
-## 八、高级岗三问
+## 八、Java 客户端实战
 
-### 8.1 为什么这么设计
+前面七节讲的都是"Redis 自己怎么工作"，这一节换成"Java 侧怎么写才不出事"。代码用 `spring-data-redis 3.5.4` + `jackson` 编译通过（JDK 17），可直接对照改造。
+
+### 8.1 四个客户端怎么选
+
+| 客户端 | 线程模型 | 连接模型 | 强项 | 短板 |
+| --- | --- | --- | --- | --- |
+| **Jedis** | 同步、**非线程安全**（4.x 的 `JedisPooled` 才线程安全） | 每个线程从池里借一个连接 | API 最贴近命令，简单直接 | 池配置不当容易耗尽；无异步 |
+| **Lettuce** | 基于 Netty，**线程安全**，天然支持异步/响应式 | 默认共享单条连接（多路复用） | 高并发下连接数少；Spring Boot 2.x 起的默认客户端 | 同步 API 阻塞时可能拖垮共享连接 |
+| **Redisson** | 基于 Netty | 共享连接 | 封装了分布式对象（`RLock`/`RMap`/`RBucket`）、看门狗、RedLock | 体量大，抽象层厚，出问题不好查 |
+| **Spring Data Redis** | 对上面三者的封装 | 由 `RedisConnectionFactory` 管理 | `RedisTemplate` 统一 API、序列化可配、与 Spring 事务/缓存集成 | 默认序列化器是最大的坑（见 8.2） |
+
+选型结论：**业务代码用 `RedisTemplate`（底层 Lettuce），分布式锁用 Redisson，只在做运维工具或极致性能场景才直接用 Jedis/Lettuce 原生 API**。
+
+### 8.2 序列化器：线上最常见的一类事故
+
+`RedisTemplate` 的默认序列化器是 **`JdkSerializationRedisSerializer`**（源码 `afterPropertiesSet` 里 new 出来的）。后果是：
+
+```bash
+127.0.0.1:6379> keys *
+1) "\xac\xed\x00\x05t\x00\x0buser:1001"
+127.0.0.1:6379> get "\xac\xed\x00\x05t\x00\x0buser:1001"
+"\xac\xed\x00\x05sr\x00\x13com.example.User..."
+```
+
+四个问题一次踩全：**key 不可读**（`keys`/`scan`/`monitor` 全是乱码）、**value 是 Java 序列化二进制**（跨语言不可用、体积大、有反序列化 RCE 风险）、**无法用 `redis-cli` 排查**、**升级类结构后旧值解析失败**。
+
+正确配置（key 用 String，value 用 JSON）：
+
+```java
+@Configuration
+public class RedisConfig {
+    @Bean
+    public RedisTemplate<String, Object> redisTemplate(RedisConnectionFactory cf) {
+        RedisTemplate<String, Object> t = new RedisTemplate<>();
+        t.setConnectionFactory(cf);
+        StringRedisSerializer keySer = new StringRedisSerializer();          // key 用字符串
+        GenericJackson2JsonRedisSerializer valSer = new GenericJackson2JsonRedisSerializer(); // value 用 JSON
+        t.setKeySerializer(keySer);
+        t.setHashKeySerializer(keySer);
+        t.setValueSerializer(valSer);
+        t.setHashValueSerializer(valSer);
+        t.afterPropertiesSet();
+        return t;
+    }
+}
+```
+
+三个细节：
+
+1. **`StringRedisTemplate` 不用配**——它默认 key/value 都是 `StringRedisSerializer`，纯字符串场景直接用它。
+2. **`GenericJackson2JsonRedisSerializer` 会在 JSON 里写入 `@class` 类型信息**，所以能反序列化回原类型；代价是包名进存储、跨服务重构类名会踩坑。要更干净就用 `Jackson2JsonRedisSerializer<T>` 指定固定类型（但只能存一种类型）。
+3. **存 `LocalDateTime` 必须注册 `JavaTimeModule`**，否则反序列化报 `InvalidDefinitionException`；配 `ObjectMapper` 时 `activateDefaultTyping` 要开 `NON_FINAL`，否则多态字段丢失类型。
+
+### 8.3 Pipeline：把 N 次 RTT 变成 1 次
+
+Redis 的瓶颈常常不是命令执行（10 万 QPS 级），而是**网络往返**。1000 次 `GET` 逐条发，RTT 1ms 就是约 1 秒；用 pipeline 一次发完，总耗时约 1 个 RTT + 服务端执行时间。
+
+```java
+public List<Object> pipelineGet(RedisTemplate<String, Object> template, int n) {
+    return template.executePipelined((RedisCallback<Object>) connection -> {
+        for (int i = 0; i < n; i++) {
+            connection.stringCommands().get(("k" + i).getBytes(StandardCharsets.UTF_8));
+        }
+        return null;                       // 回调必须返回 null，结果由返回值统一收集
+    });
+}
+```
+
+**三个坑**：
+
+- **pipeline 不是事务**：中间某条命令失败，其他命令照样执行，也不会回滚。
+- **不要一次塞几万条**：客户端与服务端都要在内存里缓冲整个批次，容易 OOM；按 500~1000 条一批。
+- **`executePipelined` 里拿不到命令的返回值**：结果是按发送顺序返回的 `List<Object>`，与请求一一对应，但**类型是反序列化后的对象**，需要自己按顺序映射。
+
+### 8.4 Lua：需要原子性时的唯一选择
+
+"比较再删除"这种复合操作，用 `GET` + `DEL` 两条命令会留下竞态窗口（拿到值之后、删除之前锁过期被别的线程抢走）。Lua 脚本在 Redis 里是**单线程原子执行**的：
+
+```java
+private static final DefaultRedisScript<Long> RELEASE_LOCK = new DefaultRedisScript<>(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+        "  return redis.call('del', KEYS[1]) " +
+        "else return 0 end", Long.class);
+
+public Long releaseLock(RedisTemplate<String, Object> template, String key, String token) {
+    return template.execute(RELEASE_LOCK, Collections.singletonList(key), token);
+}
+```
+
+要点：
+
+- **`KEYS` 与 `ARGV` 必须通过参数传**，不要把变量拼进脚本字符串（否则又回到注入与不可缓存的问题）。
+- 脚本里**不要写循环做重活**——Lua 执行期间整个 Redis 是阻塞的，`O(N)` 的脚本比 `KEYS` 还危险。
+- 客户端实际执行的是 `EVALSHA`（脚本缓存），第一次 `SCRIPT LOAD`，所以脚本内容不要动态拼接，否则缓存命中不了。
+
+### 8.5 Redisson 分布式锁的三个坑
+
+```java
+RLock lock = redisson.getLock("lock:order:" + orderId);
+boolean locked = lock.tryLock(3, TimeUnit.SECONDS);       // 只等 3 秒，租约交给看门狗
+try {
+    if (!locked) throw new BizException("请稍后重试");
+    doBusiness();
+} finally {
+    if (lock.isHeldByCurrentThread()) lock.unlock();      // 必须判断持有者，避免误释放
+}
+```
+
+| 坑 | 现象 | 原因与规避 |
+| --- | --- | --- |
+| **`tryLock` 传了 `leaseTime`** | 业务没跑完锁就自动释放，两个线程同时进临界区 | 显式指定 `leaseTime` 后**看门狗不再续期**；只有不传 `leaseTime`（或传 -1）才由看门狗每 10 秒续到 30 秒 |
+| **不判断 `isHeldByCurrentThread` 就 `unlock`** | 抛 `IllegalMonitorStateException`，或误释放别人的锁 | 加锁超时后线程并没有持锁，必须在 finally 里判断 |
+| **主从切换丢锁** | 主节点写完锁、还没同步到从节点就宕机，从节点升主后锁消失 | Redis 异步复制无法根除；对强一致要求高的场景用 ZooKeeper，或接受"极小概率重复执行"并把业务做成幂等 |
+
+### 8.6 用 SCAN 替代 KEYS
+
+`KEYS pattern` 是 `O(N)` 且**阻塞整个 Redis**，在生产上等同于一次故障。正确做法是 `SCAN` 游标分批：
+
+```java
+public Set<String> scanKeys(RedisTemplate<String, Object> template, String pattern, long count) {
+    return template.execute((RedisCallback<Set<String>>) connection -> {
+        Set<String> keys = new HashSet<>();
+        ScanOptions options = ScanOptions.scanOptions().match(pattern).count(count).build();
+        try (Cursor<byte[]> cursor = connection.keyCommands().scan(options)) {
+            while (cursor.hasNext()) {
+                keys.add(new String(cursor.next(), StandardCharsets.UTF_8));
+            }
+        }
+        return keys;
+    });
+}
+```
+
+**`SCAN` 的三个特性必须知道**：① `COUNT` 只是**提示值**，一次可能返回 0 个或远超 count 个；② **可能重复返回同一个 key**（要自己去重）；③ 遍历期间新增/删除的 key **不保证看到**（弱一致）。所以它适合"遍历/清理/统计"，不能用于"精确统计 key 数量"。
+
+---
+
+## 九、高级岗三问
+
+### 9.1 为什么这么设计
 
 | 设计决策 | 替代方案 | 选择的代价 |
 | --- | --- | --- |
@@ -1073,7 +1213,7 @@ flowchart TD
 | AOF 混合持久化 | 纯 AOF / 纯 RDB | AOF 文件不再是"纯文本可读"（前段是二进制） |
 | 7.0 多部分 AOF | 单文件 + 重写缓冲区 | 目录结构变复杂，运维脚本要改路径 |
 
-### 8.2 线上出问题怎么定位
+### 9.2 线上出问题怎么定位
 
 | 现象 | 第一步命令 | 关键指标 | 常见根因 |
 | --- | --- | --- | --- |
@@ -1087,7 +1227,7 @@ flowchart TD
 | 重启后数据变少 | `INFO persistence` | 加载日志 | AOF 优先且 AOF 不完整 |
 | 从节点读到旧数据 | `INFO replication`、`TTL` | `slave_read_only` | 从节点不主动删过期 key（3.2 前连读也不判断） |
 
-### 8.3 规模变大后会怎样
+### 9.3 规模变大后会怎样
 
 - **QPS 上来**：单实例单核打满 → 先开 `io-threads 4` 观察，再上 Cluster 分片；热 key 单独打散或加本地缓存。
 - **数据量上来**：fork 时间随内存线性增长（每 GB 约 2MB 页表），20GB 以上实例的 fork 可到百毫秒级 → 拆分成多个小实例；`rdb_last_cow_size` 监控写入放大。

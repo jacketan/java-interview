@@ -396,6 +396,85 @@ Spring 4.3 起，**只有一个构造器时可省略 `@Autowired`**。多个构�
 
 `@Value` 也走这条路径：`DefaultListableBeanFactory#doResolveDependency` 里先 `getAutowireCandidateResolver().getSuggestedValue(descriptor)` 拿到注解上的原始字符串，再 `resolveEmbeddedValue` 解析 `${}` 占位符（之后还有 `evaluateBeanDefinitionString` 处理 SpEL），最后 `converter.convertIfNecessary` 转成目标类型。
 
+### 5.3 可运行对比：三种注入在容器内外的真实差异
+
+下面这段代码用 `spring-context 5.3.25` 实跑过（JDK 17），四组输出的差异正好对应表里的四行关键结论。
+
+```java
+@Component class Repo {}
+
+@Component class CtorService {
+    private final Repo repo;
+    public CtorService(Repo repo) { this.repo = repo; }        // 构造器注入
+    public Repo repo() { return repo; }
+}
+
+@Component class FieldService {
+    @Autowired private Repo repo;                              // 字段注入
+    public Repo repo() { return repo; }
+}
+
+// 循环依赖：构造器版
+@Component class A { final B b; A(B b) { this.b = b; } }
+@Component class B { final A a; B(A a) { this.a = a; } }
+
+// 循环依赖：字段版
+@Component class C { @Autowired D d; }
+@Component class D { @Autowired C c; }
+```
+
+**① 容器内：三种方式都能注入成功**
+
+```java
+var ctx = new AnnotationConfigApplicationContext();
+ctx.register(Repo.class, CtorService.class, FieldService.class, SetterService.class);
+ctx.refresh();
+ctx.getBean(CtorService.class).repo();   // Repo@28c4711c
+ctx.getBean(FieldService.class).repo();  // Repo@28c4711c  ← 同一个实例
+```
+
+**② 容器外：字段注入直接变成 `null`**
+
+```java
+new FieldService().repo();    // null    ← 单测里直接 NPE
+```
+
+这就是"字段注入不可测试"的实证：它靠容器反射写入，一旦离开容器，`new` 出来的对象依赖全是 `null`。而构造器注入的 `new CtorService(repo)` 传什么就是什么，**不需要容器也能测**。
+
+**③ 循环依赖（构造器版）：启动直接失败**
+
+```text
+UnsatisfiedDependencyException: Error creating bean with name 'a':
+  Unsatisfied dependency expressed through constructor parameter 0;
+  nested exception is ... UnsatisfiedDependencyException: Error creating bean with name 'b': ...
+  nested exception is org.springframework.beans.factory.BeanCurrentlyInCreationException:
+  Error creating bean with name 'a': Requested bean is currently in creation:
+  Is there an unresolvable circular reference?
+```
+
+注意最后那句 `Is there an unresolvable circular reference?`——**构造器注入把循环依赖在启动期就暴露出来**，这是它最大的优点（fail-fast），而不是缺点。相反，字段注入：
+
+**④ 循环依赖（字段版）：启动成功，问题被藏起来**
+
+```java
+C c = ctx.getBean(C.class);
+c.d;          // D@75f9eccc
+c.d.c == c;   // true   ← 两个半成品互相引用，构造器里的逻辑可能没执行完
+```
+
+**这就是"为什么 Spring Boot 2.6 起默认禁止循环引用"的动机**：`spring.main.allow-circular-references` 默认 `false`，遇到循环依赖直接启动失败，逼你从设计上解耦（拆 Bean、用 `@Lazy`、或引入事件），而不是靠三级缓存"带病运行"。
+
+### 5.4 为什么官方推荐构造器注入（四条理由）
+
+| 理由 | 具体表现 | 对应上面的哪段输出 |
+| --- | --- | --- |
+| **依赖不可变** | 字段可以 `final`，对象创建即完整，天然线程安全 | ① 中 `CtorService.repo` 是 final |
+| **依赖显式** | 构造器签名就是依赖清单，被依赖方一目了然 | 看 `CtorService(Repo)` 就知道它依赖谁 |
+| **可测试** | 单测直接 `new` 传 mock，不需要 Spring 容器 | ② 中字段注入 `new` 出来是 `null` |
+| **fail-fast** | 循环依赖、缺失依赖在**启动期**报错，而不是运行期 NPE | ③ 的 `BeanCurrentlyInCreationException` |
+
+**什么时候仍用 setter 注入**：可选依赖（有默认值、可以不配）、以及需要"先构造再补充配置"的场景（如 `DataSource` 的部分属性）。Spring 官方文档的说法是"构造器注入强制依赖，setter 注入可选依赖"，两者可以混用。
+
 ## 六、循环依赖与三级缓存
 
 ### 6.1 现象

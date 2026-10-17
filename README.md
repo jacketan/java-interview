@@ -1,6 +1,6 @@
 # Java 高级 / 架构师 面试复习知识库
 
-> 32 章 · 48,036 行 · 365 张 Mermaid 原理图 · 433 道高频面试题 · 970 张对照表 · 覆盖 Java 核心、并发、JVM、框架、数据库、分布式与计算机基础
+> 32 章 · 48,911 行 · 370 张 Mermaid 原理图 · 433 道高频面试题 · 983 张对照表 · 覆盖 Java 核心、并发、JVM、框架、数据库、分布式与计算机基础
 
 ## 一、怎么用这份资料
 
@@ -115,7 +115,140 @@
 
 场景设计题按"背景 → 目标与约束 → 方案选型 → 一致性/幂等 → 容量与降级 → 监控与兜底"的顺序展开，主动说出**你放弃了什么**，这是高级岗与初级的最大区别。
 
-## 五、说明
+## 五、知识地图
+
+### 5.1 分层依赖：下层是"为什么"，上层是"怎么用"
+
+```mermaid
+flowchart BT
+  subgraph CS["07 计算机基础 底层原理"]
+    C1["网络 TCP HTTP TLS"]
+    C2["操作系统 进程 内存 IO"]
+    C3["算法 复杂度 树 DP"]
+  end
+  subgraph CORE["01 Java 核心 语言与 API"]
+    J1["语言基础 集合 泛型反射 IO Java8+"]
+  end
+  subgraph RT["02 并发 与 03 JVM 运行时"]
+    R1["并发编程"]
+    R2["JVM"]
+  end
+  subgraph APP["04 框架 工程化"]
+    A1["Spring IoC AOP 事务 Boot MyBatis"]
+  end
+  subgraph DATA["05 数据层"]
+    D1["MySQL 索引 锁 分库分表"]
+    D2["Redis 结构 高可用 实战"]
+  end
+  subgraph DIST["06 分布式与中间件"]
+    X1["一致性理论"]
+    X2["注册中心 RPC MQ 限流"]
+    X3["分布式事务 幂等"]
+  end
+  CS --> CORE --> RT --> APP --> DATA --> DIST
+```
+
+**怎么用这张图**：面试时上层问题答不上来，答案往往在下面一层。三个典型例子——
+
+- "`@Transactional` 为什么要走代理？" → 回到 **01-03 泛型与反射**（JDK/CGLIB 代理）和 **03-03 类加载**（代理类怎么生成）；
+- "为什么联合索引要最左前缀？" → 回到 **07-03 算法**（B+ 树结构）和 **05-01 索引**（回表、覆盖索引）；
+- "为什么 `synchronized` 能保证可见性？" → 回到 **02-01 JMM**（内存屏障）和 **03-01 对象头**（Mark Word）。
+
+### 5.2 32 章的阅读依赖
+
+`建议先读` 为空表示可以直接看；`印证点` 是"读这章时最好回头对照"的章节。
+
+#### 01 Java 核心
+
+| 章节 | 建议先读 | 印证点 |
+| --- | --- | --- |
+| [01-01 语言基础与对象模型](01-java-core/01-语言基础与对象模型.md) | — | [03-03](03-jvm/03-类加载机制.md) 类加载（初始化顺序）、[02-01](02-concurrency/01-线程基础与JMM.md) JMM（final 语义） |
+| [01-02 集合框架](01-java-core/02-集合框架.md) | [01-01](01-java-core/01-语言基础与对象模型.md) | [02-03](02-concurrency/03-AQS与ReentrantLock.md) AQS（`ConcurrentHashMap`）、[03-01](03-jvm/01-内存区域与对象创建.md) 对象头 |
+| [01-03 泛型与反射](01-java-core/03-泛型与反射.md) | [01-01](01-java-core/01-语言基础与对象模型.md) | [04-01](04-spring/01-Spring-IoC与AOP原理.md) AOP（动态代理）、[03-03](03-jvm/03-类加载机制.md)（代理类生成） |
+| [01-04 IO 与 NIO](01-java-core/04-IO与NIO.md) | [01-01](01-java-core/01-语言基础与对象模型.md) | [06-02](06-distributed/02-注册中心与RPC.md) RPC（Netty Reactor）、[07-02](07-cs-fundamentals/02-操作系统.md)（epoll） |
+| [01-05 Java 8+](01-java-core/05-Java8新特性与函数式编程.md) | [01-03](01-java-core/03-泛型与反射.md) | [02-04](02-concurrency/04-线程池与并发工具类.md) 线程池（`CompletableFuture`） |
+
+#### 02 并发编程
+
+| 章节 | 建议先读 | 印证点 |
+| --- | --- | --- |
+| [02-01 线程基础与 JMM](02-concurrency/01-线程基础与JMM.md) | [01-01](01-java-core/01-语言基础与对象模型.md) | [02-02](02-concurrency/02-synchronized与锁升级.md)（锁的内存语义）、[03-01](03-jvm/01-内存区域与对象创建.md)（对象头） |
+| [02-02 synchronized 与锁升级](02-concurrency/02-synchronized与锁升级.md) | [02-01](02-concurrency/01-线程基础与JMM.md) | [03-01](03-jvm/01-内存区域与对象创建.md)（Mark Word 与锁状态位） |
+| [02-03 AQS 与 ReentrantLock](02-concurrency/03-AQS与ReentrantLock.md) | [02-02](02-concurrency/02-synchronized与锁升级.md) | [01-02](01-java-core/02-集合框架.md)（并发容器的底层） |
+| [02-04 线程池与并发工具类](02-concurrency/04-线程池与并发工具类.md) | [02-01](02-concurrency/01-线程基础与JMM.md)、[02-03](02-concurrency/03-AQS与ReentrantLock.md) | [04-03](04-spring/03-SpringBoot原理.md)（Boot 线程池默认值） |
+| [02-05 并发容器与并发实战](02-concurrency/05-并发容器与并发实战.md) | [02-04](02-concurrency/04-线程池与并发工具类.md) | [03-04](03-jvm/04-性能诊断与调优实战.md)（死锁与 `jstack` 排查） |
+
+#### 03 JVM
+
+| 章节 | 建议先读 | 印证点 |
+| --- | --- | --- |
+| [03-01 内存区域与对象创建](03-jvm/01-内存区域与对象创建.md) | [01-01](01-java-core/01-语言基础与对象模型.md) | [03-02](03-jvm/02-垃圾回收与GC调优.md) GC |
+| [03-02 垃圾回收与 GC 调优](03-jvm/02-垃圾回收与GC调优.md) | [03-01](03-jvm/01-内存区域与对象创建.md) | [03-04](03-jvm/04-性能诊断与调优实战.md)（GC 日志分析） |
+| [03-03 类加载机制](03-jvm/03-类加载机制.md) | [03-01](03-jvm/01-内存区域与对象创建.md) | [01-01](01-java-core/01-语言基础与对象模型.md)（初始化顺序）、[04-01](04-spring/01-Spring-IoC与AOP原理.md)（CGLIB 生成类） |
+| [03-04 性能诊断与调优实战](03-jvm/04-性能诊断与调优实战.md) | [03-02](03-jvm/02-垃圾回收与GC调优.md)、[03-03](03-jvm/03-类加载机制.md) | [02-02](02-concurrency/02-synchronized与锁升级.md)（线程栈）、[02-04](02-concurrency/04-线程池与并发工具类.md)（线程池打满） |
+
+#### 04 框架
+
+| 章节 | 建议先读 | 印证点 |
+| --- | --- | --- |
+| [04-01 Spring IoC 与 AOP](04-spring/01-Spring-IoC与AOP原理.md) | [01-03](01-java-core/03-泛型与反射.md) | [03-03](03-jvm/03-类加载机制.md)（代理类加载）、[02-03](02-concurrency/03-AQS与ReentrantLock.md)（AQS 在锁里的影子） |
+| [04-02 Spring 事务与进阶](04-spring/02-Spring事务与循环依赖.md) | [04-01](04-spring/01-Spring-IoC与AOP原理.md)、[05-02](05-database/02-MySQL事务与锁.md) | [06-05](06-distributed/05-分布式事务与幂等.md)（分布式事务） |
+| [04-03 Spring Boot 原理](04-spring/03-SpringBoot原理.md) | [04-01](04-spring/01-Spring-IoC与AOP原理.md) | [04-02](04-spring/02-Spring事务与循环依赖.md)（自动配置的事务管理器） |
+| [04-04 MyBatis 原理](04-spring/04-MyBatis原理.md) | [01-03](01-java-core/03-泛型与反射.md)、[05-01](05-database/01-MySQL索引与执行计划.md) | [04-01](04-spring/01-Spring-IoC与AOP原理.md)（`MapperProxy` 也是代理） |
+
+#### 05 数据库与缓存
+
+| 章节 | 建议先读 | 印证点 |
+| --- | --- | --- |
+| [05-01 MySQL 索引与执行计划](05-database/01-MySQL索引与执行计划.md) | [07-03](07-cs-fundamentals/03-数据结构与算法.md)（B+ 树） | [05-02](05-database/02-MySQL事务与锁.md)（锁与索引的关系） |
+| [05-02 MySQL 事务与锁](05-database/02-MySQL事务与锁.md) | [05-01](05-database/01-MySQL索引与执行计划.md) | [04-02](04-spring/02-Spring事务与循环依赖.md)（`@Transactional` 的隔离级别与回滚） |
+| [05-03 MySQL 高可用与分库分表](05-database/03-MySQL高可用与分库分表.md) | [05-02](05-database/02-MySQL事务与锁.md) | [06-05](06-distributed/05-分布式事务与幂等.md)（跨库事务） |
+| [05-04 Redis 数据结构与持久化](05-database/04-Redis数据结构与持久化.md) | [07-03](07-cs-fundamentals/03-数据结构与算法.md)（跳表） | [05-05](05-database/05-Redis高可用与缓存问题.md)（主从与哨兵） |
+| [05-05 Redis 高可用与缓存问题](05-database/05-Redis高可用与缓存问题.md) | [05-04](05-database/04-Redis数据结构与持久化.md)、[05-02](05-database/02-MySQL事务与锁.md) | [06-01](06-distributed/01-分布式理论与一致性.md)（一致性取舍） |
+| [05-06 Redis 实战与分布式锁](05-database/06-Redis实战与分布式锁.md) | [05-05](05-database/05-Redis高可用与缓存问题.md) | [06-01](06-distributed/01-分布式理论与一致性.md)（CAP）、[06-02](06-distributed/02-注册中心与RPC.md)（RPC 幂等） |
+
+#### 06 分布式与中间件
+
+| 章节 | 建议先读 | 印证点 |
+| --- | --- | --- |
+| [06-01 分布式理论与一致性](06-distributed/01-分布式理论与一致性.md) | [07-01](07-cs-fundamentals/01-计算机网络.md) | [05-05](05-database/05-Redis高可用与缓存问题.md)（缓存一致性） |
+| [06-02 注册中心与 RPC](06-distributed/02-注册中心与RPC.md) | [06-01](06-distributed/01-分布式理论与一致性.md)、[01-04](01-java-core/04-IO与NIO.md) | [04-01](04-spring/01-Spring-IoC与AOP原理.md)（服务调用的代理） |
+| [06-03 消息队列](06-distributed/03-消息队列.md) | [06-01](06-distributed/01-分布式理论与一致性.md) | [06-05](06-distributed/05-分布式事务与幂等.md)（事务消息 vs 本地消息表） |
+| [06-04 限流熔断与网关](06-distributed/04-限流熔断与网关.md) | [06-02](06-distributed/02-注册中心与RPC.md) | [03-04](03-jvm/04-性能诊断与调优实战.md)（雪崩的排查） |
+| [06-05 分布式事务与幂等](06-distributed/05-分布式事务与幂等.md) | [06-03](06-distributed/03-消息队列.md)、[05-02](05-database/02-MySQL事务与锁.md) | — |
+
+#### 07 计算机基础
+
+| 章节 | 建议先读 | 印证点 |
+| --- | --- | --- |
+| [07-01 计算机网络](07-cs-fundamentals/01-计算机网络.md) | — | [06-02](06-distributed/02-注册中心与RPC.md)（RPC 的网络层）、[01-04](01-java-core/04-IO与NIO.md)（epoll） |
+| [07-02 操作系统](07-cs-fundamentals/02-操作系统.md) | — | [03-01](03-jvm/01-内存区域与对象创建.md)（虚拟内存）、[01-04](01-java-core/04-IO与NIO.md)（IO 模型） |
+| [07-03 数据结构与算法](07-cs-fundamentals/03-数据结构与算法.md) | — | [05-01](05-database/01-MySQL索引与执行计划.md)（B+ 树）、[05-04](05-database/04-Redis数据结构与持久化.md)（跳表） |
+
+### 5.3 三条复习主线
+
+| 主线 | 顺序 | 适合 |
+| --- | --- | --- |
+| 底座线 | 07 → 01 → 02 → 03 | 时间充裕、想把"为什么"搞清楚 |
+| 服务端线 | 04 → 05 | 面业务开发岗（CRUD + 中间件） |
+| 分布式线 | 06（需先有 05 与 [01-04](01-java-core/04-IO与NIO.md) 基础） | 面架构岗、中间件团队 |
+
+### 5.4 按问题找章节（面试现场速查）
+
+| 面试问题 | 主要看 | 补充 |
+| --- | --- | --- |
+| CPU 100% 怎么查 | [03-04](03-jvm/04-性能诊断与调优实战.md) | [02-02](02-concurrency/02-synchronized与锁升级.md)（BLOCKED 线程） |
+| 接口 P99 突然变慢 | [03-04](03-jvm/04-性能诊断与调优实战.md)、[06-04](06-distributed/04-限流熔断与网关.md) | [05-01](05-database/01-MySQL索引与执行计划.md)（慢 SQL） |
+| 内存泄漏 / OOM | [03-04](03-jvm/04-性能诊断与调优实战.md)、[03-01](03-jvm/01-内存区域与对象创建.md) | [01-02](01-java-core/02-集合框架.md)（`intern`、集合膨胀） |
+| 缓存与数据库不一致 | [05-05](05-database/05-Redis高可用与缓存问题.md) | [06-05](06-distributed/05-分布式事务与幂等.md)（最终一致） |
+| 消息重复 / 丢失 | [06-03](06-distributed/03-消息队列.md) | [06-05](06-distributed/05-分布式事务与幂等.md)（幂等） |
+| 分布式锁怎么实现 | [05-06](05-database/06-Redis实战与分布式锁.md) | [06-01](06-distributed/01-分布式理论与一致性.md)（CAP 取舍） |
+| 事务不生效 / 不回滚 | [04-02](04-spring/02-Spring事务与循环依赖.md) | [04-01](04-spring/01-Spring-IoC与AOP原理.md)（代理失效） |
+| 线程池参数怎么配 | [02-04](02-concurrency/04-线程池与并发工具类.md) | [04-03](04-spring/03-SpringBoot原理.md)（Boot 默认值） |
+| 分库分表怎么做 | [05-03](05-database/03-MySQL高可用与分库分表.md) | [06-05](06-distributed/05-分布式事务与幂等.md)（跨库事务） |
+| 秒杀 / 高并发怎么设计 | [06-04](06-distributed/04-限流熔断与网关.md) | [05-06](05-database/06-Redis实战与分布式锁.md)（Redis 扣库存） |
+
+## 六、说明
 
 - 内容基线：JDK 8 / 11 / 17 / 21、Spring Framework 5.3.x 与 Spring Boot 2.x/3.x、MySQL 5.7 与 8.0、Redis 6/7、Kafka 3.x、RocketMQ 4.9+。
 - 每章均标注了版本与关键默认值，遇到不确定的版本号时宁可不写——**面试中说错版本比不知道更减分**。
